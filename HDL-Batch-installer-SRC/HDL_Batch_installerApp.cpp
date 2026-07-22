@@ -10,6 +10,8 @@
 #include "UpdateMan.h"
 #include "flags.h"
 #include <wx/snglinst.h>
+#include <cstdio>
+#include <io.h>
 
 //(*AppHeaders
 #include "HDL_Batch_installerMain.h"
@@ -22,6 +24,15 @@ IMPLEMENT_APP(HDL_Batch_installerApp);
 wxString Get_env(wxString ENV);
 bool HDL_Batch_installerApp::OnInit()
 {
+    // --- Console embarquee : rediriger stdout/stderr vers un fichier que la
+    // fenetre principale affiche en direct (evite la console detachee). ---
+    if (!wxDirExists("logs")) wxMkdir("logs");
+    if (freopen("logs/console.log", "w", stdout))
+    {
+        setvbuf(stdout, NULL, _IONBF, 0);           // pas de buffer -> affichage immediat
+        _dup2(_fileno(stdout), _fileno(stderr));    // stderr partage le meme fichier que stdout
+        setvbuf(stderr, NULL, _IONBF, 0);
+    }
 
     wxSingleInstanceChecker* instance_chk = new wxSingleInstanceChecker;
     if (instance_chk->IsAnotherRunning() && (!wxFileExists("Common\\multi_instance.opt")) )
@@ -39,9 +50,11 @@ bool HDL_Batch_installerApp::OnInit()
 
     if (!wxApp::OnInit()) return false;
     wxInitAllImageHandlers();
-    wxBitmap BANNER = wxBITMAP_PNG(MAIN_BANNER);
-
-    wxSplashScreen *SPLASH_SCREEN = new wxSplashScreen(BANNER, wxSPLASH_CENTRE_ON_SCREEN|wxSPLASH_TIMEOUT,2500, NULL, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxFRAME_NO_TASKBAR|wxSIMPLE_BORDER|wxSTAY_ON_TOP);
+    // Ne pas transformer les avertissements (ex: libpng "iCCP: invalid rendering intent"
+    // sur des jaquettes exportees de Photoshop) en popups modaux bloquants. Les erreurs
+    // reelles restent affichees.
+    wxLog::SetLogLevel(wxLOG_Error);
+    // Splash screen desactive (l'image est desormais affichee dans la fenetre "About").
 
     HDLBINST_APPDATA = wxString::Format("%s\\HDLBInst",Get_env("appdata"));
     std::cout <<"HDLBINST_APPDATA ["<< HDLBINST_APPDATA <<"]\n";
@@ -71,6 +84,7 @@ bool HDL_Batch_installerApp::OnInit()
     wxString config_file = fname.GetPath(wxPATH_GET_VOLUME|wxPATH_GET_SEPARATOR) + "Common\\config.INI";
     wxFileConfig * main_config = new wxFileConfig( wxEmptyString, wxEmptyString, config_file);
     main_config->Read("Init/check_for_updates",&check_updates,true);
+    check_updates = false; // controle de version desactive
     /// Lang init
 
     if ( m_lang == wxLANGUAGE_UNKNOWN )
@@ -153,6 +167,13 @@ bool HDL_Batch_installerApp::OnInit()
         std::cerr <<"---stdeer redirection init---\n";
     }
 
+    // Cree et affiche la fenetre principale AVANT les operations reseau (ping,
+    // telechargement d'icones) pour qu'elle soit visible immediatement.
+    HDL_Batch_installerFrame* Frame = new HDL_Batch_installerFrame(nullptr, m_locale, custom_styles, ctor_flags);
+    Frame->Show();
+    SetTopWindow(Frame);
+    Frame->Update();
+
     ping = wxExecute("ping google.com",unused_buffer,wxEXEC_SYNC);
 
     if (ping == 0)
@@ -221,9 +242,6 @@ bool HDL_Batch_installerApp::OnInit()
         new_ver_available = false;
     }
 
-    SPLASH_SCREEN->Hide();
-    HDL_Batch_installerFrame* Frame = new HDL_Batch_installerFrame(nullptr ,m_locale,custom_styles,ctor_flags);
-    delete SPLASH_SCREEN;
     if (new_ver_available)
     {
         UpdateMan* A = new UpdateMan(nullptr, svr_ver, versionTAG);
@@ -253,8 +271,6 @@ bool HDL_Batch_installerApp::OnInit()
         }
     }
     delete main_config;
-    Frame->Show();
-    SetTopWindow(Frame);
     return wxsOK;
 }
 

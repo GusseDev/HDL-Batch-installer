@@ -38,6 +38,7 @@ public:
            const wxSize& size=wxDefaultSize);
     virtual ~ArtMan();
     wxArrayString ELF_t;
+    wxCheckBox* pushToHDD = nullptr; // option: transfert direct des assets vers le HDD (+OPL)
     //(*Declarations(ArtMan)
     wxButton* download;
     wxCheckBox* CheckCERT;
@@ -87,6 +88,7 @@ private:
     void Onothers_markallClick(wxCommandEvent& event);
     //*)
     long Request_art(wxString ELF, wxString suffix);
+    long run_hidden(const wxString& command); // execute wget/cmd sans fenetre console, sortie -> console embarquee
     void cleanup(void);
     //typedef std::pair<std::string, std::string> art_alias_t;
     //std::map<std::string, std::string> art_map;

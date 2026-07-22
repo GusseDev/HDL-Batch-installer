@@ -1,5 +1,23 @@
-﻿# HDL Batch installer
+﻿# HDL Batch installer — GusseDev fork
 
+> **Unofficial personal fork.** All credit for this tool belongs to **Matias Israelson (El_isra)** and the [original HDL-Batch-installer team](https://github.com/israpps/HDL-Batch-installer) — their work is genuinely extraordinary, and this fork only adds a few quality-of-life tweaks on top of it. For the reference, maintained version, please use the [upstream project](https://github.com/israpps/HDL-Batch-installer).
+
+## Latest release — [v3.8.0 Revision 14](https://github.com/GusseDev/HDL-Batch-installer/releases/latest)
+
+### What this fork adds
+
+- **Unified game list** — games waiting to be installed are highlighted at the top of the same list; the Install button appears automatically. Drag & drop ISO files or supported archives right onto it.
+- **Fully fluid list** — artwork thumbnails load in a **background thread**, so scrolling stays perfectly smooth even on large libraries. A progress bar (styled like the disk-capacity bar) shows loading, with a **Stop** button, and the rows you look at load first.
+- **Persistent thumbnail cache** — thumbnails are cached to disk (`Downloads/_artcache`) and locally downloaded assets (`Downloads/ART`) are reused first, so on restart the icons appear almost instantly with no HDD access when the cache is warm.
+- **Live install progress** — `HDL.EXE` output streamed into an embedded console, per-game progress bar, pause / resume.
+- **Assets made easy** — optional auto-download of art / CFG / CHT after install; one-click copy to `+OPL` on the HDD; double-click a game to preview its media.
+- **Quality of life** — search field, clickable column sorting with indicator arrows, sizes in MB and GB, automatic HDD detection at startup, and blocking libpng (iCCP) warning popups suppressed.
+
+**Download:** grab `HDL-Batch-installer-v3.8.0-rev14-x64.zip` from the [releases page](https://github.com/GusseDev/HDL-Batch-installer/releases/latest), extract anywhere, and run `HDL-Batch-installer.exe` **as administrator** (first launch downloads the OSD icon database automatically). Windows x64, built with a reproducible MSYS2 / MINGW64 toolchain via `build.sh`.
+
+---
+
+## Original project
 
 [![wxWidgets version](https://img.shields.io/badge/wxWidgets-3.0.5-blue)](https://www.wxwidgets.org/downloads/#v3.0.5)
 ![project status](https://img.shields.io/badge/Project%20status-Active-00cc22)

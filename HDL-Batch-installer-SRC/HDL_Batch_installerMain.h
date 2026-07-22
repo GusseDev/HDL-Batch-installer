@@ -27,6 +27,16 @@
 #include <wx/statline.h>
 #include <wx/textctrl.h>
 //*)
+#include <wx/timer.h>
+#include <wx/bitmap.h>
+#include <wx/gauge.h>
+#include <wx/stattext.h>
+#include <map>
+#include <vector>
+#include <deque>
+#include <thread>
+#include <atomic>
+#include <mutex>
 //#include "md5/md5.h"
 //#include <wx/xml/xml.h>
 #include <wx/time.h>
@@ -55,6 +65,10 @@
 #include "include/macro-vault.h"
 #include "flags.h"
 #include "include/locale_table.h"
+
+class HddSpaceBar;     // barre d'espace HDD personnalisee (definie dans le .cpp)
+class MiniProgressBar; // barre de progression d'install (meme style, definie dans le .cpp)
+struct InstalledGameRow { wxString name; wxString elf; wxString size; int media; };
 
 class HDL_Batch_installerFrame: public wxFrame
 {
@@ -268,6 +282,79 @@ private:
     void OnICONS_DOWNLOAD(void);
     void ask_2_download_icons(void);
     wxString cat_errdump();
+    void TransferDownloadsToOPL(void); // envoi direct des assets telecharges vers la partition +OPL du HDD
+    // --- Console embarquee en bas de la fenetre ---
+    wxTextCtrl* LogPanel = nullptr;
+    wxTimer* LogTimer = nullptr;
+    long m_logOffset = 0;
+    void OnLogTimer(wxTimerEvent& event);
+    // --- Medias du jeu (art depuis +OPL/ART sur le HDD) ---
+    void OnInstalledGameActivated(wxListEvent& event); // double-clic -> galerie des medias
+    // --- Chargement des vignettes OPL dans un THREAD de fond (UI fluide) ---
+    // Le thread lit les _ICO.png du HDD ; le thread UI ne fait que decoder la petite
+    // icone + la poser sur la ligne. Barre de progression + bouton d'interruption.
+    void StartArtPrefetch();                           // (re)construit la file et lance le thread de fond
+    void StopArtPrefetch();                            // stoppe+joint le thread, libere le device, masque la barre
+    void ArtWorkerRun(int epoch);                      // corps du thread de fond (I/O PFS uniquement, pas de GUI)
+    void OnArtResult(int epoch, const wxString& elf, const wxString& path, int source); // thread UI: decode + pose + progression + cache disque
+    void ClearArtDiskCache();                          // vide le cache disque des vignettes (invalidation)
+    void ArtLoaderFinished(int epoch);                 // thread UI: fin du chargement -> masque la barre, joint le thread
+    void OnArtCancel(wxCommandEvent& event);           // bouton "Stop"
+    void OnArtTimer(wxTimerEvent& event);              // poll du scroll -> priorite aux lignes visibles
+    void ReprioritizeVisible();                        // remonte les lignes visibles en tete de file
+    void UpdateRowIcon(const wxString& elf, const wxBitmap& bmp); // pose la vignette sur la ligne du jeu (si visible)
+    wxTimer* m_artTimer = nullptr;                      // timer de re-priorisation (scroll) pendant le chargement
+    wxArrayString m_artNames;                          // contenu de +OPL/ART liste une seule fois
+    std::string m_artCacheHdd;                          // HDD pour lequel le cache memoire est valide (evite de tout recharger si HDD inchange)
+    int m_artW = 24, m_artH = 24;                      // taille des vignettes (depuis l'image list)
+    long m_artLastTop = -1;                            // derniere position de scroll (detection du defilement)
+    std::thread m_artThread;                            // thread de fond
+    std::mutex m_artQMutex;                             // protege m_artQueue
+    std::deque<wxString> m_artQueue;                    // elfs a charger (ordre = priorite, front d'abord)
+    std::atomic<bool> m_artStop{false};                // demande d'arret du thread
+    std::atomic<int> m_artDoneCount{0};                // vignettes traitees (pour la barre)
+    int m_artTotal = 0;                                // total a charger
+    int m_artEpoch = 0;                                // generation courante (ignore les callbacks perimes)
+    bool m_artLoaderActive = false;                    // un chargement est-il en cours ?
+    wxPanel* m_artProgPanel = nullptr;                 // barre de progression (conteneur)
+    MiniProgressBar* m_artBar = nullptr;               // meme style que la barre de capacite disque
+    wxStaticText* m_artProgLabel = nullptr;
+    wxButton* m_artCancelBtn = nullptr;
+    // RAII : met le loader en pause le temps d'une operation PFS/HDL du thread principal
+    struct ArtPause {
+        HDL_Batch_installerFrame* f; bool was;
+        ArtPause(HDL_Batch_installerFrame* f_) : f(f_) { was = f->m_artLoaderActive; if (was) f->StopArtPrefetch(); }
+        ~ArtPause() { if (was) f->StartArtPrefetch(); }
+    };
+    void RebuildFromCache();                           // (re)affiche la liste depuis m_installedGames + filtre de recherche
+    std::vector<InstalledGameRow> m_installedGames;    // jeux installes (donnees, pour le filtrage)
+    wxTextCtrl* m_searchField = nullptr;               // champ de recherche
+    void OnSearchText(wxCommandEvent& event);          // filtre la liste au fil de la frappe
+    bool m_startupDetect = false;                      // detection HDD au demarrage (popup "aucun HDD" supprime)
+    int m_sortCol = -1;                                // colonne de tri courante (-1 = aucune)
+    bool m_sortAsc = true;                             // sens du tri
+    void OnListColClick(wxListEvent& event);           // tri au clic sur l'en-tete de colonne
+    void ShowMediaGallery(const wxString& title, const wxString& infoText, const wxArrayString& images);
+    void OnCopyAssetsToHDD(wxCommandEvent& event);   // menu contextuel: pousser Downloads/ vers +OPL
+    void OnRefreshListHotkey(wxCommandEvent& event); // F5 -> rafraichir la liste
+    std::map<wxString, wxBitmap> m_artCache;         // cache des vignettes _LAB (par serial)
+    HddSpaceBar* m_spaceBar = nullptr;               // barre d'espace HDD dessinee
+    wxMenu* m_hddMenu = nullptr;                      // menu "HDD Management" (ex-onglet)
+    wxArrayString m_pending;                          // jeux en attente d'installation (chemins ISO/archive)
+    bool m_installing = false;                        // installation en cours (bouton Install fait office de Pause)
+    bool m_pauseRequested = false;
+    MiniProgressBar* m_rowGauge = nullptr;             // barre de progression posee sur la ligne du jeu en cours
+    long RunInstallCaptured(const wxString& command);  // lance HDL.EXE cache, sortie -> console, % -> jauge
+    void InsertPendingRow(const wxString& path);     // ajoute une ligne "en attente" (fond jaune) en haut de la liste
+    void DownloadAssetsForELF(const wxString& elf);   // telecharge les assets d'un serial (apres install reussie)
+    void UpdateInstallButton();                       // affiche/masque le bouton Install selon m_pending
+    // --- Glisser-deposer / archives ---
+    wxArrayString ExtractArchiveGames(const wxString& archive); // extrait une archive, renvoie les images de jeu trouvees
+    void CleanIsoStage();                                       // supprime le dossier de staging des ISO extraits
+public:
+    void AddGamesToList(const wxArrayString& paths);            // ajoute ISO, ou extrait archives (drop / dialogue)
+    void OnDropFilesEvent(wxDropFilesEvent& event);            // WM_DROPFILES -> AddGamesToList
+private:
     DECLARE_EVENT_TABLE()
 public:
     wxLocale& m_locale;

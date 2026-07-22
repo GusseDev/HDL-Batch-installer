@@ -13,6 +13,9 @@
 #include <wx/intl.h>
 #include <wx/string.h>
 //*)
+#include <wx/bitmap.h>
+#include <wx/image.h>
+#include <wx/statbmp.h>
 
 //(*IdInit(About)
 const long About::ID_STATICTEXT1 = wxNewId();
@@ -66,6 +69,27 @@ About::About(wxWindow* parent,wxWindowID id,const wxPoint& pos,const wxSize& siz
     Connect(wxID_ANY,wxEVT_INIT_DIALOG,(wxObjectEventFunction)&About::OnInit);
     Connect(wxEVT_PAINT,(wxObjectEventFunction)&About::OnPaint);
     //*)
+    // --- Banniere (ancien splash screen) affichee en haut de la fenetre "About" ---
+    {
+        wxBitmap banner = wxBITMAP_PNG(MAIN_BANNER);
+        if (banner.IsOk())
+        {
+            wxImage bimg = banner.ConvertToImage();
+            double sc = 400.0 / bimg.GetWidth();
+            if (bimg.GetHeight() * sc > 160.0) sc = 160.0 / bimg.GetHeight();
+            int bw = (int)(bimg.GetWidth() * sc), bh = (int)(bimg.GetHeight() * sc);
+            bimg.Rescale(bw, bh, wxIMAGE_QUALITY_HIGH);
+            // descend tout le contenu existant pour faire de la place en haut
+            for (wxWindowList::iterator it = GetChildren().begin(); it != GetChildren().end(); ++it)
+            {
+                wxPoint p = (*it)->GetPosition();
+                (*it)->Move(p.x, p.y + bh);
+            }
+            new wxStaticBitmap(this, wxID_ANY, wxBitmap(bimg), wxPoint((400 - bw) / 2, 0), wxSize(bw, bh));
+            SetClientSize(wxSize(400, 389 + bh));
+            Centre();
+        }
+    }
 }
 
 About::~About()
