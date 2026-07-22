@@ -58,6 +58,7 @@ public:
     wxRadioButton* gndb_intern;
     wxTextCtrl* OPLPART;
     //*)
+    wxCheckBox* AUTO_ASSETS_CHK = nullptr; // option: auto-download des assets a l'ajout d'un jeu
 
 protected:
 

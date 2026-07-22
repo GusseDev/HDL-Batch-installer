@@ -9,6 +9,7 @@
 // FRAME & Dialog
 #include "DnDFile.h"
 #include "HDL_Batch_installerMain.h"
+#include <wx/dir.h>
 #include "About.h"
 #include "Config.h"
 #include "Component_error.h"
@@ -26,6 +27,16 @@
 #include "gamename/parser.h" //includes both database & parser function
 #include "MD5Man.h"
 #include "PFSShell.h"
+#include <wx/scrolwin.h>
+#include <wx/wrapsizer.h>
+#include <wx/statbmp.h>
+#include <wx/stattext.h>
+#include <wx/accel.h>
+#include <wx/dnd.h>
+#include <wx/dcbuffer.h>
+#include <wx/process.h>
+#include <wx/stream.h>
+#include <algorithm>
 
 #include "xpm/cd.xpm"
 #include "xpm/dvdd.xpm"
@@ -44,6 +55,127 @@ int DVDDL;
 using namespace std;
 bool first_init = false;
 
+// Id du timer de re-priorisation des vignettes (distinct du LogTimer).
+static const int ID_ART_TIMER = wxID_HIGHEST + 733;
+// Source d'une vignette : cache disque (deja 24x24), asset local telecharge, ou lecture HDD.
+enum ArtSource { ART_FROM_CACHE = 0, ART_FROM_LOCAL = 1, ART_FROM_HDD = 2 };
+
+// Cible de glisser-deposer sur la liste d'installation : accepte les images de
+// jeu (ISO/CUE/...) et les archives (zip/rar/7z), qui sont extraites puis ajoutees.
+class IsoDropTarget : public wxFileDropTarget
+{
+public:
+    IsoDropTarget(HDL_Batch_installerFrame* frame) : m_frame(frame) {}
+    virtual bool OnDropFiles(wxCoord, wxCoord, const wxArrayString& filenames) override
+    { if (m_frame) m_frame->AddGamesToList(filenames); return true; }
+private:
+    HDL_Batch_installerFrame* m_frame;
+};
+
+// Barre d'espace HDD personnalisee : portion utilisee coloree + pourcentage au
+// centre + legende (Used / Free / Total) au-dessus.
+class HddSpaceBar : public wxPanel
+{
+public:
+    HddSpaceBar(wxWindow* parent)
+        : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxSize(-1, 48))
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        Bind(wxEVT_PAINT, &HddSpaceBar::OnPaint, this);
+        Bind(wxEVT_SIZE,  &HddSpaceBar::OnSize,  this);
+    }
+    void SetUsage(long totalMB, long usedMB, long freeMB)
+    { m_total = totalMB; m_used = usedMB; m_free = freeMB; m_has = true; Refresh(); }
+    void Clear() { m_has = false; Refresh(); }
+private:
+    long m_total = 0, m_used = 0, m_free = 0;
+    bool m_has = false;
+    static wxString Fmt(long mb)
+    { return (mb >= 1024) ? wxString::Format("%.0f GB", mb / 1024.0) : wxString::Format("%ld MB", mb); }
+    void OnSize(wxSizeEvent&) { Refresh(); }
+    void OnPaint(wxPaintEvent&)
+    {
+        wxAutoBufferedPaintDC dc(this);
+        wxSize sz = GetClientSize();
+        dc.SetBackground(wxBrush(GetBackgroundColour()));
+        dc.Clear();
+        dc.SetFont(GetFont());
+        wxString legend = m_has
+            ? wxString::Format(_("Used %s     Free %s     Total %s"), Fmt(m_used), Fmt(m_free), Fmt(m_total))
+            : wxString(_("No PS2 HDD detected - connect one and click \"Search ps2 HDD's\""));
+        dc.SetTextForeground(wxColour(70, 70, 70));
+        wxSize ts = dc.GetTextExtent(legend);
+        dc.DrawText(legend, (sz.x - ts.x) / 2, 2);
+        int barX = 3, barY = 22, barW = sz.x - 6, barH = sz.y - barY - 3;
+        if (barW < 10 || barH < 6) return;
+        dc.SetPen(wxPen(wxColour(170, 170, 170)));
+        dc.SetBrush(wxBrush(wxColour(238, 238, 238)));
+        dc.DrawRoundedRectangle(barX, barY, barW, barH, 4);
+        if (m_has && m_total > 0)
+        {
+            double frac = (double)m_used / (double)m_total;
+            if (frac < 0) frac = 0;
+            if (frac > 1) frac = 1;
+            int fillW = (int)(barW * frac);
+            wxColour c = (frac < 0.80) ? wxColour(56, 162, 71)
+                       : (frac < 0.95) ? wxColour(214, 154, 40)
+                                       : wxColour(200, 66, 66);
+            dc.SetPen(*wxTRANSPARENT_PEN);
+            dc.SetBrush(wxBrush(c));
+            if (fillW > 0) dc.DrawRoundedRectangle(barX, barY, (fillW < 8 ? 8 : fillW), barH, 4);
+            wxString pct = wxString::Format("%d%%", (int)(frac * 100 + 0.5));
+            dc.SetFont(GetFont().Bold());
+            wxSize ps = dc.GetTextExtent(pct);
+            dc.SetTextForeground((frac > 0.45) ? *wxWHITE : wxColour(60, 60, 60));
+            dc.DrawText(pct, barX + (barW - ps.x) / 2, barY + (barH - ps.y) / 2);
+        }
+    }
+};
+
+// Barre de progression d'installation : meme style que la barre d'espace HDD
+// (rectangle arrondi + remplissage colore + pourcentage au centre).
+class MiniProgressBar : public wxPanel
+{
+public:
+    MiniProgressBar(wxWindow* parent)
+        : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxSize(120, 16))
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        SetFont(wxFont(7, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_BOLD));
+        Bind(wxEVT_PAINT, &MiniProgressBar::OnPaint, this);
+    }
+    void SetValue(int pct)
+    {
+        if (pct < 0) pct = 0;
+        if (pct > 100) pct = 100;
+        if (pct != m_pct) { m_pct = pct; Refresh(); Update(); }
+    }
+private:
+    int m_pct = 0;
+    void OnPaint(wxPaintEvent&)
+    {
+        wxAutoBufferedPaintDC dc(this);
+        wxSize sz = GetClientSize();
+        dc.SetBackground(wxBrush(GetBackgroundColour()));
+        dc.Clear();
+        dc.SetPen(wxPen(wxColour(170, 170, 170)));
+        dc.SetBrush(wxBrush(wxColour(238, 238, 238)));
+        dc.DrawRoundedRectangle(0, 0, sz.x, sz.y, 3);
+        int fillW = sz.x * m_pct / 100;
+        if (fillW > 0)
+        {
+            dc.SetPen(*wxTRANSPARENT_PEN);
+            dc.SetBrush(wxBrush(wxColour(56, 162, 71))); // vert, comme la barre disque
+            dc.DrawRoundedRectangle(0, 0, (fillW < 6 ? 6 : fillW), sz.y, 3);
+        }
+        dc.SetFont(GetFont());
+        wxString t = wxString::Format("%d%%", m_pct);
+        wxSize ts = dc.GetTextExtent(t);
+        dc.SetTextForeground((m_pct > 45) ? *wxWHITE : wxColour(50, 50, 50));
+        dc.DrawText(t, (sz.x - ts.x) / 2, (sz.y - ts.y) / 2);
+    }
+};
+
 ///CONFIG TABLE
 namespace CFG
 {
@@ -61,6 +193,7 @@ wxString    NBD_IP;
 bool        SHARE_DATA;
 bool        DISPATCH_SYSTEM_NOTIFICATIONS;
 bool        ALLOW_EXPERIMENTAL;
+bool        AUTO_ASSETS;          //telecharge auto les assets a l'ajout d'un jeu
 bool        HDDManagerGameTitleDISP;
 bool        HDDManagerSubPartDSP;
 //    bool        UPDATE_AVAILABLE = false;
@@ -314,7 +447,7 @@ HDL_Batch_installerFrame::HDL_Batch_installerFrame(wxWindow* parent, wxLocale& l
     Button3 = new wxButton(Panel2, ID_BUTTON8, _("\?"), wxDefaultPosition, wxSize(16,23), 0, wxDefaultValidator, _T("ID_BUTTON8"));
     BoxSizer2->Add(Button3, 1, wxALL|wxALIGN_TOP|wxSHAPED, 1);
     FlexGridSizer8->Add(BoxSizer2, 1, wxEXPAND, 5);
-    Installed_game_list = new wxListCtrl(Panel2, ID_LISTCTRL2, wxDefaultPosition, wxSize(509,378), wxLC_REPORT|wxLC_AUTOARRANGE|wxLC_SORT_ASCENDING|wxLC_HRULES|wxLC_VRULES|wxLC_NO_SORT_HEADER|wxBORDER_SUNKEN|wxVSCROLL, wxDefaultValidator, _T("ID_LISTCTRL2"));
+    Installed_game_list = new wxListCtrl(Panel2, ID_LISTCTRL2, wxDefaultPosition, wxSize(509,378), wxLC_REPORT|wxLC_HRULES|wxLC_VRULES|wxBORDER_SUNKEN|wxVSCROLL, wxDefaultValidator, _T("ID_LISTCTRL2"));
     Installed_game_list->SetBackgroundColour(wxSystemSettings::GetColour(wxSYS_COLOUR_LISTBOX));
     wxListItem col0;
     col0.SetId(0);
@@ -332,8 +465,8 @@ HDL_Batch_installerFrame::HDL_Batch_installerFrame(wxWindow* parent, wxLocale& l
     // Add third column
     wxListItem col2;
     col2.SetId(2);
-    col2.SetText( _("size (MB)") );
-    col2.SetWidth(90);
+    col2.SetText( _("Size (MB / GB)") );
+    col2.SetWidth(130);
     Installed_game_list->InsertColumn(2, col2);
 
     // Add 4th column
@@ -520,6 +653,175 @@ HDL_Batch_installerFrame::HDL_Batch_installerFrame(wxWindow* parent, wxLocale& l
     Connect(DELETE_GAME_ID,wxEVT_COMMAND_MENU_SELECTED,(wxObjectEventFunction)&HDL_Batch_installerFrame::OnGameDeletionRequest);
     Connect(wxID_ANY,wxEVT_CLOSE_WINDOW,(wxObjectEventFunction)&HDL_Batch_installerFrame::OnClose);
     //*)
+    // --- Titre de la fenetre avec le numero de version ---
+    SetTitle(wxString::Format("HDL Batch Installer %s | By Matias Israelson (El_isra)", versionTAG));
+    // --- Barre d'espace HDD personnalisee (remplace la jauge + le texte) ---
+    m_spaceBar = new HddSpaceBar(Panel5);
+    FlexGridSizer3->Detach(hdd_used_space); hdd_used_space->Hide();
+    FlexGridSizer3->Replace(Gauge1, m_spaceBar); Gauge1->Hide();
+
+    // --- Suppression des onglets : vue unique empilee (installes en haut, file en bas) ---
+    Notebook1->RemovePage(0);
+    Notebook1->RemovePage(0);
+    Notebook1->RemovePage(0);
+    // NB: le notebook masque les pages inactives -> il FAUT les re-afficher.
+    Panel1->Reparent(Panel5); Panel1->Show(); // Install (file d'attente)
+    Panel2->Reparent(Panel5); Panel2->Show(); // Browse (jeux installes)
+    Panel3->Reparent(Panel5); Panel3->Hide(); // HDD Management -> deplace dans un menu
+    FlexGridSizer1->Detach(FlexGridSizer4);
+    Notebook1->Destroy(); Notebook1 = nullptr;
+    // Vue UNIFIEE : une seule liste (jeux installes + jeux en attente en haut).
+    // On masque l'ancienne file separee et on ramene ses controles sous la liste.
+    Panel1->Hide();
+    game_list__->Hide();
+    // detacher de l'ancien sizer AVANT de reparenter/re-ajouter (sinon assert wx)
+    FlexGridSizer7->Detach(install);
+    FlexGridSizer7->Detach(clear_iso_list);
+    FlexGridSizer7->Detach(dma_choice);
+    FlexGridSizer7->Detach(use_database);
+    install->Reparent(Panel2);
+    clear_iso_list->Reparent(Panel2);
+    dma_choice->Reparent(Panel2);
+    use_database->Reparent(Panel2);
+    {
+        wxBoxSizer* bottomBar = new wxBoxSizer(wxHORIZONTAL);
+        wxButton* addGamesBtn = new wxButton(Panel2, wxID_ANY, _("Add games"));
+        Connect(addGamesBtn->GetId(), wxEVT_COMMAND_BUTTON_CLICKED, (wxObjectEventFunction)&HDL_Batch_installerFrame::OnSEARCH_ISOClick);
+        bottomBar->Add(addGamesBtn, 0, wxALL, 3);
+        bottomBar->Add(install, 0, wxALL, 3);
+        bottomBar->Add(clear_iso_list, 0, wxALL, 3);
+        bottomBar->Add(new wxStaticText(Panel2, wxID_ANY, _("DMA:")), 0, wxALIGN_CENTER_VERTICAL|wxLEFT, 8);
+        bottomBar->Add(dma_choice, 0, wxALL, 3);
+        bottomBar->Add(use_database, 0, wxALIGN_CENTER_VERTICAL|wxLEFT, 8);
+        FlexGridSizer8->Add(bottomBar, 0, wxEXPAND|wxTOP, 4);
+    }
+    install->Show(false); // apparaitra quand des jeux seront en attente
+    // La liste occupe la ligne extensible (row 1) mais avait une hauteur mini de 378px :
+    // quand la barre de progression s'affiche, faute de place, la barre du bas (Add games/
+    // Install/DMA) etait rognee. On abaisse le mini pour qu'elle reste toujours visible.
+    Installed_game_list->SetMinSize(wxSize(-1, 140));
+    {
+        wxBoxSizer* stack = new wxBoxSizer(wxVERTICAL);
+        stack->Add(Panel2, 1, wxEXPAND|wxALL, 6);
+        FlexGridSizer1->Add(stack, 1, wxEXPAND, 0);
+    }
+
+    // --- Menu "HDD Management" (anciens boutons de l'onglet HDD Management) ---
+    m_hddMenu = new wxMenu();
+    m_hddMenu->Append(ID_BUTTON10, _("HDD Manager"));
+    m_hddMenu->Append(ID_BUTTON11, _("Mount HDD Partition"));
+    m_hddMenu->Append(ID_BUTTON12, _("PFS File Browser"));
+    m_hddMenu->AppendSeparator();
+    m_hddMenu->Append(ID_BUTTON13, _("Inject OPL Launcher (all games)"));
+    m_hddMenu->Append(ID_BUTTON5,  _("Inject MBR"));
+    m_hddMenu->Append(ID_BUTTON9,  _("Recover MBR"));
+    m_hddMenu->Append(ID_BUTTON6,  _("Modify Header"));
+    GetMenuBar()->Insert(1, m_hddMenu, _("HDD Management"));
+    m_hddMenu->Enable(ID_BUTTON10, false);
+    m_hddMenu->Enable(ID_BUTTON11, false);
+    m_hddMenu->Enable(ID_BUTTON13, false);
+    m_hddMenu->Enable(ID_BUTTON5,  false);
+    m_hddMenu->Enable(ID_BUTTON9,  false);
+    Connect(ID_BUTTON10, wxEVT_COMMAND_MENU_SELECTED, (wxObjectEventFunction)&HDL_Batch_installerFrame::OnButton2Click3);
+    Connect(ID_BUTTON11, wxEVT_COMMAND_MENU_SELECTED, (wxObjectEventFunction)&HDL_Batch_installerFrame::OnButton4Click);
+    Connect(ID_BUTTON12, wxEVT_COMMAND_MENU_SELECTED, (wxObjectEventFunction)&HDL_Batch_installerFrame::OnPFSBrowserCallClick);
+    Connect(ID_BUTTON13, wxEVT_COMMAND_MENU_SELECTED, (wxObjectEventFunction)&HDL_Batch_installerFrame::Onmass_header_injectionClick);
+    Connect(ID_BUTTON5,  wxEVT_COMMAND_MENU_SELECTED, (wxObjectEventFunction)&HDL_Batch_installerFrame::OnMBR_EVENTClick);
+    Connect(ID_BUTTON9,  wxEVT_COMMAND_MENU_SELECTED, (wxObjectEventFunction)&HDL_Batch_installerFrame::OnMBRExtractRequestClick);
+    Connect(ID_BUTTON6,  wxEVT_COMMAND_MENU_SELECTED, (wxObjectEventFunction)&HDL_Batch_installerFrame::OnButton2Click);
+    // "Get List" -> petit bouton icone "refresh"
+    Parse_hdl_toc->SetLabel(wxEmptyString);
+    Parse_hdl_toc->SetBitmap(wxArtProvider::GetBitmap(wxART_MAKE_ART_ID_FROM_STR(_T("wxART_REDO")), wxART_BUTTON));
+    Parse_hdl_toc->SetToolTip(_("Refresh list"));
+    Parse_hdl_toc->SetMinSize(wxSize(34, 26));
+    Parse_hdl_toc->SetMaxSize(wxSize(40, 28));
+    // Champ de recherche pour filtrer la liste
+    m_searchField = new wxTextCtrl(Panel2, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(180, 24));
+    m_searchField->SetHint(_("Search..."));
+    m_searchField->Bind(wxEVT_TEXT, &HDL_Batch_installerFrame::OnSearchText, this);
+    BoxSizer2->Insert(1, m_searchField, 2, wxALL|wxALIGN_CENTER_VERTICAL, 3);
+    Panel2->Layout();
+    Panel5->Layout();
+    // --- Console embarquee en bas de la fenetre (remplace la console detachee) ---
+    LogPanel = new wxTextCtrl(this, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(-1, 150),
+                              wxTE_MULTILINE|wxTE_READONLY|wxTE_DONTWRAP|wxHSCROLL);
+    LogPanel->SetBackgroundColour(wxColour(18, 18, 18));
+    LogPanel->SetForegroundColour(wxColour(210, 210, 210));
+    {
+        wxFont lf = LogPanel->GetFont();
+        lf.SetFamily(wxFONTFAMILY_TELETYPE);
+        LogPanel->SetFont(lf);
+    }
+    // --- Barre de progression du chargement des vignettes (+ bouton Interrompre) ---
+    m_artProgPanel = new wxPanel(this, wxID_ANY);
+    {
+        wxBoxSizer* ps = new wxBoxSizer(wxHORIZONTAL);
+        m_artProgLabel = new wxStaticText(m_artProgPanel, wxID_ANY, _("Loading artwork"));
+        m_artBar = new MiniProgressBar(m_artProgPanel); // meme style que la barre de capacite disque
+        m_artBar->SetMinSize(wxSize(-1, 18));
+        m_artCancelBtn = new wxButton(m_artProgPanel, wxID_ANY, _("Stop"), wxDefaultPosition, wxSize(70, 24));
+        m_artCancelBtn->Bind(wxEVT_BUTTON, &HDL_Batch_installerFrame::OnArtCancel, this);
+        ps->Add(m_artProgLabel, 0, wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT, 6);
+        ps->Add(m_artBar, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
+        ps->Add(m_artCancelBtn, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        m_artProgPanel->SetSizer(ps);
+    }
+    m_artProgPanel->Hide();
+    {
+        wxBoxSizer* RootSizer = new wxBoxSizer(wxVERTICAL);
+        RootSizer->Add(Panel5, 1, wxEXPAND, 0);
+        RootSizer->Add(m_artProgPanel, 0, wxEXPAND | wxTOP | wxBOTTOM, 2);
+        RootSizer->Add(LogPanel, 0, wxEXPAND);
+        SetSizer(RootSizer);
+        RootSizer->SetSizeHints(this);
+        Layout();
+        Centre();
+    }
+    LogTimer = new wxTimer(this);
+    Bind(wxEVT_TIMER, &HDL_Batch_installerFrame::OnLogTimer, this);
+    LogTimer->Start(250);
+    // Timer dedie au chargement progressif des vignettes (id propre pour ne pas croiser LogTimer)
+    m_artTimer = new wxTimer(this, ID_ART_TIMER);
+    Bind(wxEVT_TIMER, &HDL_Batch_installerFrame::OnArtTimer, this, ID_ART_TIMER);
+    // Double-clic sur un jeu installe -> galerie des medias trouves sur le HDD
+    Connect(ID_LISTCTRL2, wxEVT_COMMAND_LIST_ITEM_ACTIVATED, (wxObjectEventFunction)&HDL_Batch_installerFrame::OnInstalledGameActivated);
+    // Clic sur un en-tete de colonne -> tri
+    Installed_game_list->Bind(wxEVT_COMMAND_LIST_COL_CLICK, &HDL_Batch_installerFrame::OnListColClick, this);
+    // Entree de menu contextuel : copier les assets telecharges (Downloads/) vers le HDD (+OPL)
+    {
+        wxMenuItem* copyAssetsItem = new wxMenuItem(&Browser_menu, wxID_ANY, _("Copy downloaded assets to HDD (+OPL)"), wxEmptyString, wxITEM_NORMAL);
+        copyAssetsItem->SetBitmap(wxArtProvider::GetBitmap(wxART_MAKE_ART_ID_FROM_STR(_T("wxART_GO_UP")),wxART_BUTTON));
+        Browser_menu.Insert(2, copyAssetsItem); // juste apres "Download assets"
+        Connect(copyAssetsItem->GetId(), wxEVT_COMMAND_MENU_SELECTED, (wxObjectEventFunction)&HDL_Batch_installerFrame::OnCopyAssetsToHDD);
+    }
+    // F5 = rafraichir la liste des jeux installes
+    {
+        wxAcceleratorEntry acc(wxACCEL_NORMAL, WXK_F5, wxID_REFRESH);
+        SetAcceleratorTable(wxAcceleratorTable(1, &acc));
+        Connect(wxID_REFRESH, wxEVT_COMMAND_MENU_SELECTED, (wxObjectEventFunction)&HDL_Batch_installerFrame::OnRefreshListHotkey);
+    }
+    // Glisser-deposer d'ISO / d'archives (mecanisme WM_DROPFILES : plus fiable
+    // qu'OLE pour une app elevee/admin).
+    Installed_game_list->DragAcceptFiles(true);
+    Installed_game_list->Bind(wxEVT_DROP_FILES, &HDL_Batch_installerFrame::OnDropFilesEvent, this);
+    Panel2->DragAcceptFiles(true);
+    Panel2->Bind(wxEVT_DROP_FILES, &HDL_Batch_installerFrame::OnDropFilesEvent, this);
+#ifdef __WXMSW__
+    // L'app tourne en admin (manifeste) : Windows (UIPI) bloque par defaut le
+    // glisser-deposer venant de l'explorateur non-eleve (curseur "interdit").
+    // On autorise explicitement les messages de drop pour ce process.
+    {
+        typedef BOOL (WINAPI *PCWMF)(UINT, DWORD);
+        HMODULE u32 = GetModuleHandleW(L"user32.dll");
+        PCWMF pChangeFilter = u32 ? (PCWMF)GetProcAddress(u32, "ChangeWindowMessageFilter") : nullptr;
+        if (pChangeFilter)
+        {
+            pChangeFilter(WM_DROPFILES, 1 /*MSGFLT_ADD*/);
+            pChangeFilter(WM_COPYDATA, 1);
+            pChangeFilter(0x0049 /*WM_COPYGLOBALDATA*/, 1);
+        }
+    }
+#endif
     wxImageList* CDTLIST = new wxImageList(24, 24, true);
     CDXPM::CD = CDTLIST->Add(wxIcon(cd_xpm));
     CDXPM::DVD = CDTLIST->Add(wxIcon(dvd_xpm));
@@ -556,6 +858,7 @@ HDL_Batch_installerFrame::HDL_Batch_installerFrame(wxWindow* parent, wxLocale& l
     main_config->Read("HDDManager/display_games_titles", &CFG::HDDManagerGameTitleDISP, true);
     main_config->Read("HDDManager/display_subpartition", &CFG::HDDManagerSubPartDSP, false);
     main_config->Read("FEATURES/allow_experimental", &CFG::ALLOW_EXPERIMENTAL, false);
+    main_config->Read("Installation/auto_download_assets", &CFG::AUTO_ASSETS, false);
 
 //  main_config->Read("Init/Check_for_Updates",&CFG::UPDATE_WARNINGS,false);
     COLOR(08)
@@ -579,6 +882,14 @@ HDL_Batch_installerFrame::HDL_Batch_installerFrame(wxWindow* parent, wxLocale& l
     ICONS_FOLDER= EXEC_PATH + "Common\\HDD-OSD-Icon-Database-main\\ico";
     first_init = true;
     if (!wxDirExists(ICONS_FOLDER)) wxMkDir(ICONS_FOLDER);
+    // Auto-detection du HDD au demarrage (lit directement le disque ; silencieux si aucun).
+    CallAfter([this]()
+    {
+        m_startupDetect = true;
+        wxCommandEvent dummy;
+        OnButton1Click(dummy);
+        m_startupDetect = false;
+    });
 }
 
 void cache_cleanup(void)
@@ -599,12 +910,16 @@ void cache_cleanup(void)
 
 HDL_Batch_installerFrame::~HDL_Batch_installerFrame()
 {
+    // Joint le thread de vignettes s'il tourne encore (evite std::terminate)
+    m_artStop = true;
+    if (m_artThread.joinable()) m_artThread.join();
     //(*Destroy(HDL_Batch_installerFrame)
     //*)
 }
 
 void HDL_Batch_installerFrame::OnQuit(wxCommandEvent& event)
 {
+    StopArtPrefetch(); // joint le thread de vignettes avant de quitter
     cache_cleanup();
     exit(0);
 }
@@ -714,8 +1029,9 @@ void HDL_Batch_installerFrame::OnSEARCH_ISOClick(wxCommandEvent& event)
                                          _("Select your PS2 games"),
                                          CFG::DEFAULT_ISO_PATH,
                                          "",
-                                         wxString::Format("%s|*.ISO;*.CUE;*.NRG;*.GI;*.IML;*.ZSO|%s|*.ISO|%s|*.cue|%s|*.nrg|%s|*.gi|%s|*.iml|%s|*.zso",
-                                                 _("All supported formats (*.ISO;*.CUE;*.NRG;*.GI;*.IML;*.ZSO)"),
+                                         wxString::Format("%s|*.ISO;*.CUE;*.NRG;*.GI;*.IML;*.ZSO;*.zip;*.rar;*.7z|%s|*.zip;*.rar;*.7z|%s|*.ISO|%s|*.cue|%s|*.nrg|%s|*.gi|%s|*.iml|%s|*.zso",
+                                                 _("All supported formats (ISO/CUE/NRG/GI/IML/ZSO + archives)"),
+                                                 _("Archives (*.zip;*.rar;*.7z)"),
                                                  _("ISO 9660 (*.ISO)"),
                                                  _("CDRWIN cuesheets (*.cue)"),
                                                  _("Nero images (*.nrg)"),
@@ -739,6 +1055,15 @@ void HDL_Batch_installerFrame::OnSEARCH_ISOClick(wxCommandEvent& event)
         {
             bool isZSO=false;
             path = ISO_PATHS.Item(game_count);
+            {
+                wxString aext = path.AfterLast('.').Lower();
+                if (aext == "zip" || aext == "rar" || aext == "7z")
+                {
+                    m_pending.Add(path); InsertPendingRow(path); // archive: extraite a l'install
+                    valid_gamecount++;
+                    continue;
+                }
+            }
             wxString extension = path.Right(4);
             if (!extension.CmpNoCase(".zso")) // ZSO: make sure HDL Dump will be able to process the file, by using the original ISO placed on the same folder.
             {
@@ -768,9 +1093,7 @@ void HDL_Batch_installerFrame::OnSEARCH_ISOClick(wxCommandEvent& event)
             int type = -1;
             if (is_PS2(path, &type))
             {
-                long indx = game_list__->InsertItem(0,path);
-                game_list__->SetItemImage(indx, type);
-                if (isZSO) game_list__->SetItemTextColour(indx, *wxBLUE);
+                m_pending.Add(path); InsertPendingRow(path);
                 valid_gamecount++;
             }
             else
@@ -796,6 +1119,7 @@ void HDL_Batch_installerFrame::OnSEARCH_ISOClick(wxCommandEvent& event)
     }
     COLOR(0f) cout << "Loaded ISO's------------------------\n";
     COLOR(07)
+    UpdateInstallButton();
     wxEndBusyCursor();
 }
 
@@ -805,6 +1129,8 @@ void HDL_Batch_installerFrame::OnTextCtrl1Text1(wxCommandEvent& event)
 
 void HDL_Batch_installerFrame::OnClose(wxCloseEvent& event)
 {
+    StopArtPrefetch(); // joint le thread de vignettes avant de quitter
+    CleanIsoStage();
     cache_cleanup();
     exit(0);
 }
@@ -851,7 +1177,7 @@ void HDL_Batch_installerFrame::OnButton1Click(wxCommandEvent& event)
     }
     wxEndBusyCursor();
 
-    if (HDDCount == 0)
+    if (HDDCount == 0 && !m_startupDetect)
     {
         wxMessageBox(_("no PS2 HDD's Found"),_("warning"),wxICON_EXCLAMATION);
     }
@@ -871,12 +1197,80 @@ void HDL_Batch_installerFrame::OnParse_hdl_tocClick(wxCommandEvent& event)
     List_refresh_request();
 }
 
+// Process qui capture sa sortie et retient son code de fin (install non bloquante).
+class CapturingProcess : public wxProcess
+{
+public:
+    CapturingProcess() { Redirect(); }
+    bool ended = false; int code = -1;
+    virtual void OnTerminate(int, int status) override { code = status; ended = true; }
+};
+
+// Extrait le dernier "NN%" d'un texte (format HDL.EXE : "[...] 12%, ... remaining").
+static bool ParseLastPercent(const wxString& s, int& out)
+{
+    int pos = s.Find('%', true);
+    if (pos <= 0) return false;
+    int end = pos - 1;
+    while (end >= 0 && s[end] == ' ') end--;
+    int beg = end;
+    while (beg >= 0 && ((s[beg] >= '0' && s[beg] <= '9') || s[beg] == '.')) beg--;
+    if (beg == end) return false;
+    double v;
+    if (!s.Mid(beg + 1, end - beg).ToDouble(&v)) return false;
+    out = (int)(v + 0.5);
+    if (out < 0) out = 0;
+    if (out > 100) out = 100;
+    return true;
+}
+
+// Lance HDL.EXE en process CACHE, draine sa sortie EN DIRECT dans la console
+// integree, et met a jour la jauge (m_rowGauge) a partir du pourcentage parse.
+long HDL_Batch_installerFrame::RunInstallCaptured(const wxString& command)
+{
+    CapturingProcess proc;
+    long pid = wxExecute(command, wxEXEC_ASYNC | wxEXEC_HIDE_CONSOLE, &proc);
+    if (!pid) { std::cout << "! failed to launch HDL.EXE\n"; return -1; }
+    auto drain = [this](wxInputStream* s)
+    {
+        if (!s) return;
+        char buf[4096];
+        s->Read(buf, sizeof(buf) - 1);
+        size_t n = s->LastRead();
+        if (!n) return;
+        buf[n] = 0;
+        wxString chunk = wxString::FromUTF8(buf, n);
+        if (chunk.empty()) chunk = wxString(buf, wxConvLibc, n);
+        int pct;
+        if (m_rowGauge && ParseLastPercent(chunk, pct)) m_rowGauge->SetValue(pct);
+        chunk.Replace("\r", "\n");
+        if (LogPanel)
+        {
+            LogPanel->AppendText(chunk);
+            if (LogPanel->GetNumberOfLines() > 3000)
+                LogPanel->Remove(0, LogPanel->XYToPosition(0, LogPanel->GetNumberOfLines() - 1500));
+        }
+    };
+    while (!proc.ended)
+    {
+        while (proc.IsInputAvailable()) drain(proc.GetInputStream());
+        while (proc.IsErrorAvailable()) drain(proc.GetErrorStream());
+        wxYield();
+        wxMilliSleep(35);
+    }
+    while (proc.IsInputAvailable()) drain(proc.GetInputStream());
+    while (proc.IsErrorAvailable()) drain(proc.GetErrorStream());
+    return proc.code;
+}
+
 void HDL_Batch_installerFrame::OninstallClick(wxCommandEvent& event)
 {
+    if (m_installing) { m_pauseRequested = true; install->SetLabel(_("Pausing...")); return; }
+    StopArtPrefetch(); // libere le device : l'install pompe les evenements pendant HDL.EXE (device attache = crash HDL Dump)
     int not_enough_space_count = 0;
     wxString messagebuffer, HIDE_SWITCH, strr, msg, command1;
     wxString hddd = selected_hdd->GetString(selected_hdd->GetSelection());
-    long original_item_count = game_list__->GetItemCount();
+    long original_item_count = m_pending.GetCount();
     long installation_retcode;
 
     wxBeginBusyCursor();
@@ -900,7 +1294,12 @@ void HDL_Batch_installerFrame::OninstallClick(wxCommandEvent& event)
 #endif
     std::cout <<"game count: "<< original_item_count<<std::endl;
     cout << "> begining installation...\n";
-    install_progress = new wxProgressDialog(_("Installing"), wxEmptyString, original_item_count, this, wxPD_APP_MODAL|wxPD_ELAPSED_TIME|wxPD_SMOOTH|wxPD_AUTO_HIDE);
+    // Installation NON bloquante : la fenetre principale reste visible (console + liste).
+    m_installing = true; m_pauseRequested = false;
+    install->SetLabel(_("Pause")); install->Enable(true);
+    clear_iso_list->Enable(false);
+    if (!m_rowGauge) m_rowGauge = new MiniProgressBar(Installed_game_list);
+    m_rowGauge->Hide();
     /// /////////////////////////////////MAIN INSTALL LOOP///////////////////////////////// ///
     //for (int current_index = 0; current_index < game_list__->GetItemCount(); current_index++)
     int report_counter = 0;
@@ -910,19 +1309,54 @@ void HDL_Batch_installerFrame::OninstallClick(wxCommandEvent& event)
                   _media
 //                   _DBA,
                   ;
-    wxAppProgressIndicator *toolbar_progress = new wxAppProgressIndicator(this, game_list__->GetItemCount());
-    while (game_list__->GetItemCount() > 0)
+    wxAppProgressIndicator *toolbar_progress = new wxAppProgressIndicator(this, original_item_count);
+    while (!m_pending.IsEmpty())
     {
         command1.clear();
-        if (install_progress->WasCancelled()) break;
-        int current_index = (original_item_count - game_list__->GetItemCount());
+        if (m_pauseRequested) break;
+        int current_index = (original_item_count - (long)m_pending.GetCount());
         toolbar_progress->SetValue(current_index);
-        strr = game_list__->GetItemText(0,0);
+        strr = m_pending.Item(0);
+        wxString origName = strr.AfterLast('\\').AfterLast('/'); // nom affiche dans la liste (avant extraction archive)
+        wxString archiveStage; // si archive: dossier de staging a supprimer apres l'install reussie
+        {
+            wxString aext = strr.AfterLast('.').Lower();
+            if (aext == "zip" || aext == "rar" || aext == "7z")
+            {
+                std::cout << "> archive detected, extracting before install: " << strr.ToStdString() << "\n";
+                wxArrayString extracted = ExtractArchiveGames(strr);
+                if (extracted.IsEmpty())
+                {
+                    report_counter++;
+                    _filepath.Add(strr);
+                    _ELF.Add(wxEmptyString);
+                    _media.Add("archive");
+                    _reason.Add(_("No PS2 game image was found inside the archive."));
+                    m_pending.RemoveAt(0);
+                    continue;
+                }
+                archiveStage = EXEC_PATH + "_iso_stage\\" + wxFileName(strr).GetName();
+                strr = extracted.Item(0); // installe la premiere image extraite
+            }
+        }
         wxString resultt;
         std::cout << "\n>index: " << current_index <<std::endl;
         msg = _("installing: ");
         msg.append(strr);
-        install_progress->Update(current_index, msg.substr(msg.find_last_of("\\")+1));
+        // positionne la jauge de progression sur la ligne du jeu en cours
+        {
+            long grow = Installed_game_list->FindItem(-1, origName);
+            wxRect rr;
+            if (grow >= 0 && m_rowGauge && Installed_game_list->GetItemRect(grow, rr))
+            {
+                int gw = 120, gh = 16;
+                if (gw > rr.width - 8) gw = rr.width - 8;
+                m_rowGauge->SetSize(rr.x + rr.width - gw - 4, rr.y + (rr.height - gh) / 2, gw, gh);
+                m_rowGauge->SetValue(0);
+                m_rowGauge->Show();
+                Installed_game_list->EnsureVisible(grow);
+            }
+        }
         wxString ELF, title;
         std::string inject_mode;
         ///-------------------------------PULL DATA
@@ -974,7 +1408,8 @@ void HDL_Batch_installerFrame::OninstallClick(wxCommandEvent& event)
                             << "\n---\n"
                             << command1 <<"\n";
         COLOR(0d)
-        installation_retcode = wxExecute(command1,wxEXEC_SYNC);
+        installation_retcode = RunInstallCaptured(command1);
+        if (m_rowGauge) m_rowGauge->Hide();
         COLOR(08)
         //if (CFG::DEBUG_LEVEL > 5 || (CTOR_FLAGS & FORCE_HIGH_DEBUG_LEVEL) )
         cout << "\n>returned value [" << installation_retcode <<"]\n";
@@ -1022,7 +1457,14 @@ void HDL_Batch_installerFrame::OninstallClick(wxCommandEvent& event)
             else
                 _reason.Add("Unhandled error. Check program log for more details...");
         }
-        game_list__->DeleteItem(0);
+        if (installation_retcode == 0 && CFG::AUTO_ASSETS)
+        {
+            std::cout << "> downloading assets for " << ELF.ToStdString() << " ...\n";
+            DownloadAssetsForELF(ELF);
+        }
+        m_pending.RemoveAt(0);
+        if (!archiveStage.IsEmpty() && installation_retcode == 0)
+            wxFileName::Rmdir(archiveStage, wxPATH_RMDIR_RECURSIVE); // ISO extrait supprime apres install reussie
 
         if (not_enough_space_count > 3)
         {
@@ -1031,10 +1473,17 @@ void HDL_Batch_installerFrame::OninstallClick(wxCommandEvent& event)
         }
 
     }/// /////////////////////////////////MAIN INSTALL LOOP///////////////////////////////// ///
-    COLOR(08) std::cout << endl << "> installation process finished.\n";
-    delete install_progress;
+    bool wasPaused = m_pauseRequested;
+    m_installing = false;
+    install->SetLabel(_("Install"));
+    clear_iso_list->Enable(true);
+    if (m_rowGauge) m_rowGauge->Hide();
+    COLOR(08) std::cout << endl << (wasPaused ? "> installation paused.\n" : "> installation process finished.\n");
     delete toolbar_progress;
     COLOR(07)
+    if (wasPaused && !m_pending.IsEmpty())
+        wxMessageBox(wxString::Format(_("Installation paused.\n\n%d game(s) remaining. Click 'Install' to resume."),
+                                      (int)m_pending.GetCount()), _("Paused"), wxICON_INFORMATION);
     ///
     if (report_counter != 0)
     {
@@ -1056,6 +1505,8 @@ void HDL_Batch_installerFrame::OninstallClick(wxCommandEvent& event)
         COLOR(07)
         wxRemoveFile(EXEC_PATH + "list.ico");
     }
+    if (m_pending.IsEmpty()) CleanIsoStage(); // ISO extraits d'archives supprimes une fois tout installe
+    UpdateInstallButton();
     wxEndBusyCursor();
     wxBell();
 }
@@ -1081,6 +1532,7 @@ void HDL_Batch_installerFrame::OnCheckBox1Click1(wxCommandEvent& event)
 
 void HDL_Batch_installerFrame::OnMBR_EVENTClick(wxCommandEvent& event)
 {
+    ArtPause _artpause(this); // ecriture HDL.EXE : device doit etre detache -> pause du loader
     if (wxMessageBox(_("This feature will rewrite the PS2 BOOTSTRAP PROGRAM for this HDD.\n"
                        "Please make sure you know what you are doing.\n"
                        "MBR Programs must be headerless binaries, uncompressed, compiled with fixed load adress at 0x100000 and encrypted with KELFTool\n\n"
@@ -1133,19 +1585,19 @@ void HDL_Batch_installerFrame::OnButton2Click(wxCommandEvent& event)
 
 void HDL_Batch_installerFrame::Onclear_iso_listClick(wxCommandEvent& event)
 {
-    if (game_list__->GetItemCount() == 0)// IF gamelist is empty, get out
+    if (m_pending.IsEmpty())
     {
-        wxMessageBox(_("Game list is already empty"),"",wxICON_EXCLAMATION);
+        wxMessageBox(_("The install queue is already empty"),"",wxICON_EXCLAMATION);
         return;
     }
-    else
+    if (wxMessageBox("",_("Clear the install queue??"),wxICON_QUESTION | wxYES_NO) == wxYES)
     {
-        if(wxMessageBox("",_("Clear List??"),wxICON_QUESTION | wxYES_NO) ==wxYES)
-        {
-            game_list__->DeleteAllItems();
-            COLOR(08) cout<<"> cleaning game list\n";
-            COLOR(07)
-        }
+        m_pending.Clear();
+        CleanIsoStage(); // supprime aussi les ISO extraits d'archives
+        if (selected_hdd->GetSelection() != wxNOT_FOUND) List_refresh_request();
+        else Installed_game_list->DeleteAllItems();
+        UpdateInstallButton();
+        COLOR(08) cout<<"> cleared install queue\n"; COLOR(07)
     }
 }
 
@@ -1197,11 +1649,28 @@ void HDL_Batch_installerFrame::Enable_HDD_dependant_objects(bool WTF_should_I_do
 #else
         HDDManagerButton->Enable(true);
 #endif
+        if (m_hddMenu)
+        {
+            m_hddMenu->Enable(ID_BUTTON5,  true);  // Inject MBR
+            m_hddMenu->Enable(ID_BUTTON13, true);  // Inject OPL Launcher (all games)
+            m_hddMenu->Enable(ID_BUTTON9,  true);  // Recover MBR
+            m_hddMenu->Enable(ID_BUTTON11, true);  // Mount HDD Partition
+            m_hddMenu->Enable(ID_BUTTON10, PFSSHELL_USABLE); // HDD Manager
+        }
         ///this one has nothing to do
         Installed_game_list->DeleteAllItems();
     }
     else
     {
+        if (m_hddMenu)
+        {
+            m_hddMenu->Enable(ID_BUTTON5,  false);
+            m_hddMenu->Enable(ID_BUTTON13, false);
+            m_hddMenu->Enable(ID_BUTTON9,  false);
+            m_hddMenu->Enable(ID_BUTTON11, false);
+            m_hddMenu->Enable(ID_BUTTON10, false);
+        }
+        if (m_spaceBar) m_spaceBar->Clear();
         Parse_hdl_toc->Disable();
         install->Disable();
         MBR_EVENT->Disable();
@@ -1215,11 +1684,15 @@ void HDL_Batch_installerFrame::Enable_HDD_dependant_objects(bool WTF_should_I_do
 
 void HDL_Batch_installerFrame::Update_hdd_data(void)
 {
+    StopArtPrefetch(); // usage exclusif de PFSSHELL ici ; un rafraichissement de liste relancera le loader
     Enable_HDD_dependant_objects(false);///Temporarly disble just in case data parsing fails
     ///MAKE SURE TO RE-ENABLE EVERYTHING THAT WAS DISABLEd HERE INSIDE THE 'if (toc_ret == 0)' BLOCK
     wxString command;
     wxString label = selected_hdd->GetString(selected_hdd->GetSelection());
     HDD_TOKEN = wxString::Format("\\\\.\\PHYSICALDRIVE%s", label.SubString(3, label.find(':')-1));
+    // N'invalide le cache memoire des vignettes QUE si le HDD a reellement change
+    // (sinon un simple re-select rechargerait tout inutilement ; le cache disque reste, lui, valable).
+    if (m_artCacheHdd != HDD_TOKEN) { m_artCache.clear(); m_artCacheHdd = HDD_TOKEN; }
     cout << "selected "<< label <<endl;
     command.Printf("HDL.EXE toc %s",label);
     wxArrayString result,std_error;
@@ -1252,17 +1725,7 @@ void HDL_Batch_installerFrame::Update_hdd_data(void)
             }
         }
         std::cout << "total: ["<<size_total<<"]\nused:  ["<<size_used<<"]\nfree:  ["<<size_free<<"]\n";
-        Gauge1->SetRange(size_total);
-        Gauge1->SetValue(size_used);
-
-        hdd_used_space->Clear();
-        hdd_used_space->AppendText( wxString::Format(_("Total: %dGb | Used: %d%s | Free: %d%s"),
-                                    (size_total / 1024),
-                                    (size_used > 1024) ? (size_used / 1024) : size_used,
-                                    (size_used > 1024) ? ("Gb") : "Mb",
-                                    (size_free > 1024) ? (size_free / 1024) : size_free,
-                                    (size_free > 1024) ? ("Gb") : "Mb"
-                                                    ));
+        m_spaceBar->SetUsage(size_total, size_used, size_free);
 #if PFSSHELL_ALLOWED
         std::cout << "initializing libPS2HDD...\n";
         if (!PFSSHELL.SelectDevice(HDD_TOKEN.c_str()))
@@ -1277,6 +1740,7 @@ void HDL_Batch_installerFrame::Update_hdd_data(void)
         MenuHDDFormat->Enable(PFSSHELL_USABLE);
 #endif
         Enable_HDD_dependant_objects(true); //re-enable & clean installed game list
+        List_refresh_request(); //auto: lister les jeux des qu'un HDD est selectionne (plus besoin de "get list")
     }
     else
     {
@@ -1297,68 +1761,108 @@ void HDL_Batch_installerFrame::OnButton2Click1(wxCommandEvent& event)
 
 void HDL_Batch_installerFrame::List_refresh_request()
 {
-    Installed_game_list->DeleteAllItems();
+    StopArtPrefetch(); // stoppe un chargement de vignettes en cours (device libere avant HDL.EXE)
+    // 1) recupere la liste des jeux installes (donnees seulement)
+    m_installedGames.clear();
     wxArrayString result;
-    wxString command = "HDL.EXE hdl_toc ";
-    command.append(selected_hdd->GetString(selected_hdd->GetSelection()));
+    wxString command = "HDL.EXE hdl_toc " + selected_hdd->GetString(selected_hdd->GetSelection());
+    std::cout << "listing games of " << selected_hdd->GetString(selected_hdd->GetSelection()) << "\n\n";
+    wxExecute(command, result);
+    for (size_t x = 0; x < result.GetCount(); x++) cout << result.Item(x) << "\n";
 
-    std::cout << "listing games of "<< selected_hdd->GetString(selected_hdd->GetSelection()) << "\n\n";
-
-    wxExecute(command,result);
-
-    for(size_t x = 0; x < result.GetCount(); x++)
-    {
-        cout << result.Item(x) << "\n";
-    }
-
-    int media = MEDIA_DVD;
-    std::string Gamename;
-    long int gamesize;
-    std::string ELF;
     wxString line;
-    for(size_t x = 0; x < result.GetCount(); x++)
+    for (size_t x = 0; x < result.GetCount(); x++)
     {
         line = result.Item(x);
-        if (line.Mid(0,1) =='t') continue;//if this is the first line then skip it
-
-
-        if (line.Mid(0,1) =='C') media = MEDIA_CD;
-        if (line.Mid(0,1) =='D') media = MEDIA_DVD;
-        gamesize = wxAtoi(line.Mid(4,line.find_first_of("B") - 5));
-
-        if (line.find('*') == NOT_FOUND)///if DMA mode is found use it to locate ELF and game title, ensuring compatibility with HDLGI
+        if (line.Mid(0,1) == 't') continue; // premiere ligne = entete
+        int media = (line.Mid(0,1) == 'C') ? MEDIA_CD : MEDIA_DVD;
+        long gamesize = wxAtoi(line.Mid(4, line.find_first_of("B") - 5));
+        wxString ELF, Gamename;
+        if (line.find('*') == NOT_FOUND)
         {
             ELF = line.SubString(34, line.find_first_of(" ",34)-1);
-            Gamename = line.substr( line.find_first_of(" ",34) +2 );
+            Gamename = line.substr(line.find_first_of(" ",34) + 2);
         }
-        else     ///No DMA found, use hardcoded offsets that SHOULD ensure compatibility with winhiip
+        else
         {
-            ELF = line.SubString(line.find('*') + 4, line.find_first_of(" ",line.find('*') + 4)-1);
-            Gamename = line.substr( line.find_first_of(" ",line.find('*') + 4) +2 );
+            ELF = line.SubString(line.find('*')+4, line.find_first_of(" ",line.find('*')+4)-1);
+            Gamename = line.substr(line.find_first_of(" ",line.find('*')+4) + 2);
         }
-        ///VALUE ASSINGMENT
-        long itemIndex = Installed_game_list->InsertItem(0, Gamename);// col. 1
-        Installed_game_list->SetItem(itemIndex, 1, ELF); // col. 2
-        Installed_game_list->SetItem(itemIndex, 2, wxString::Format(wxT("%i"),gamesize / 1024)); //col. 3
-        if (media == MEDIA_CD) {
-            Installed_game_list->SetItem(itemIndex, 3, "CD"); //col. 4
-            Installed_game_list->SetItemImage(itemIndex, CDXPM::CD);
-        }
-        else {
-            Installed_game_list->SetItem(itemIndex, 3, "DVD"); //col. 4
-            Installed_game_list->SetItemImage(itemIndex, CDXPM::DVD);
-        }
+        InstalledGameRow g;
+        g.name = Gamename; g.elf = ELF;
+        g.size = wxString::Format("%i", (int)(gamesize / 1024));
+        g.media = media;
+        m_installedGames.push_back(g);
+    }
+    if (result.GetCount() <= 2) wxMessageBox(_("This HDD has no PS2 Games inside"), error_caption);
+    // 2) affichage IMMEDIAT (icones CD/DVD par defaut) -> pas d'attente meme sur grosse ludotheque
+    RebuildFromCache();
+    // 3) chargement des vignettes OPL en arriere-plan, par petits lots (UI reactive)
+    StartArtPrefetch();
+}
+
+// (Re)construit l'affichage : jeux en attente (haut, jaune) + jeux installes
+// filtres par le champ de recherche. Sans I/O (utilise m_installedGames + m_artCache).
+void HDL_Batch_installerFrame::RebuildFromCache()
+{
+    Installed_game_list->Freeze();
+    Installed_game_list->DeleteAllItems();
+    wxImageList* il = Installed_game_list->GetImageList(wxIMAGE_LIST_SMALL);
+    if (il) for (int k = il->GetImageCount() - 1; k >= 3; k--) il->Remove(k);
+
+    wxString q = m_searchField ? m_searchField->GetValue().Lower() : wxString();
+    for (int p = (int)m_pending.GetCount() - 1; p >= 0; p--) InsertPendingRow(m_pending.Item(p)); // en attente en haut
+
+    for (size_t k = 0; k < m_installedGames.size(); k++)
+    {
+        const InstalledGameRow& g = m_installedGames[k];
+        if (!q.IsEmpty() && !g.name.Lower().Contains(q) && !g.elf.Lower().Contains(q)) continue;
+        long i = Installed_game_list->InsertItem(Installed_game_list->GetItemCount(), g.name);
+        Installed_game_list->SetItem(i, 1, g.elf);
+        long mb = 0; g.size.ToLong(&mb);
+        Installed_game_list->SetItem(i, 2, wxString::Format("%ld MB (%.2f GB)", mb, mb / 1024.0));
+        Installed_game_list->SetItem(i, 3, g.media == MEDIA_CD ? "CD" : "DVD");
+        wxString elfT = g.elf; elfT.Trim();
+        std::map<wxString, wxBitmap>::iterator it = m_artCache.find(elfT);
+        if (il && it != m_artCache.end()) Installed_game_list->SetItemImage(i, il->Add(it->second));
+        else Installed_game_list->SetItemImage(i, g.media == MEDIA_CD ? CDXPM::CD : CDXPM::DVD);
     }
     GameCountDisplay->Clear();
-    GameCountDisplay->AppendText(wxString::Format(_("%d games"), Installed_game_list->GetItemCount()));
-    if (result.GetCount() <= 2) wxMessageBox(_("This HDD has no PS2 Games inside"), error_caption);
-
+    GameCountDisplay->AppendText(wxString::Format(_("%d games"), (int)m_installedGames.size()));
     int size_ELFID = Installed_game_list->GetColumnWidth(1);
     int size_SIZE = Installed_game_list->GetColumnWidth(2);
     int size_MEDIA = Installed_game_list->GetColumnWidth(3);
-    int TOTAL;
-    Installed_game_list->GetClientSize(&TOTAL, NULL);
+    int TOTAL; Installed_game_list->GetClientSize(&TOTAL, NULL);
     Installed_game_list->SetColumnWidth(0, TOTAL - (size_ELFID + size_SIZE + size_MEDIA));
+    UpdateInstallButton();
+    Installed_game_list->Thaw();
+}
+
+void HDL_Batch_installerFrame::OnSearchText(wxCommandEvent& event)
+{
+    RebuildFromCache();
+}
+
+// Tri de la liste au clic sur un en-tete de colonne (re-clic = inverse le sens).
+void HDL_Batch_installerFrame::OnListColClick(wxListEvent& event)
+{
+    int col = event.GetColumn();
+    if (col < 0) return;
+    if (col == m_sortCol) m_sortAsc = !m_sortAsc;
+    else { m_sortCol = col; m_sortAsc = true; }
+    Installed_game_list->ShowSortIndicator(m_sortCol, m_sortAsc); // fleche native dans l'en-tete
+    int c = m_sortCol; bool asc = m_sortAsc;
+    std::sort(m_installedGames.begin(), m_installedGames.end(),
+        [c, asc](const InstalledGameRow& a, const InstalledGameRow& b)
+        {
+            int r;
+            if (c == 1)      r = a.elf.CmpNoCase(b.elf);
+            else if (c == 2) { long sa = 0, sb = 0; a.size.ToLong(&sa); b.size.ToLong(&sb); r = (sa < sb) ? -1 : (sa > sb) ? 1 : 0; }
+            else if (c == 3) r = a.media - b.media;
+            else             r = a.name.CmpNoCase(b.name);
+            return asc ? (r < 0) : (r > 0);
+        });
+    RebuildFromCache();
 }
 
 void HDL_Batch_installerFrame::On_MiniOPL_Update_request(wxCommandEvent& event)
@@ -1373,6 +1877,7 @@ void HDL_Batch_installerFrame::On_MiniOPL_Update_request(wxCommandEvent& event)
 void HDL_Batch_installerFrame::OnButton2Click3(wxCommandEvent& event)
 {
 #if PFSSHELL_ALLOWED
+    ArtPause _artpause(this); // le HDD Manager (modal) monopolise le device : pause du loader (reprise a la fermeture)
     HDDManager *MANAGER = new HDDManager(this, HDD_TOKEN, CFG::HDDManagerGameTitleDISP, CFG::HDDManagerSubPartDSP);
     MANAGER->ShowModal();
     delete MANAGER;
@@ -1402,6 +1907,7 @@ void HDL_Batch_installerFrame::Onprint_partition_tableClick(wxCommandEvent& even
 
 void HDL_Batch_installerFrame::Onmass_header_injectionClick(wxCommandEvent& event)
 {
+    ArtPause _artpause(this); // ecriture HDL.EXE (modify_header) : pause du loader
     wxString system_cnf  = EXEC_PATH + "system.cnf";
     wxString icon_sys    = EXEC_PATH + "icon.sys";
     wxString icon_icn    = EXEC_PATH + "list.ico";
@@ -1557,6 +2063,7 @@ void HDL_Batch_installerFrame::RemoveISOfromList(wxCommandEvent& event)
 
 void HDL_Batch_installerFrame::OnExtractInstalledGameRequest(wxCommandEvent& event)
 {
+    ArtPause _artpause(this); // HDL.EXE dump (acces disque brut) : pause du loader
     long itemIndex = -1;
     int ripcount = 0, currrip=0;
     while ((itemIndex = Installed_game_list->GetNextItem(itemIndex, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED)) != wxNOT_FOUND)
@@ -1636,6 +2143,7 @@ void HDL_Batch_installerFrame::OnExtractInstalledGameRequest(wxCommandEvent& eve
 
 void HDL_Batch_installerFrame::OnInstalledGameRenameRequest(wxCommandEvent& event)
 {
+    ArtPause _artpause(this); // ecriture HDL.EXE (modify) : pause du loader
     long itemIndex = -1;
     wxString title,title_backup;
     wxString game_title, game_title2,extraction_path, full_extraction_path;
@@ -1689,6 +2197,581 @@ void HDL_Batch_installerFrame::OnInstalledGameAssetsDownloadRequest(wxCommandEve
     }
     ArtMan artman_dlg(this,ELF);///Create instance of download manager outside loop, the dialog will iterate the list on it's own
     artman_dlg.ShowModal();
+    // Envoi direct des assets telecharges vers la partition +OPL du HDD (si l'option a ete cochee)
+    if (artman_dlg.pushToHDD && artman_dlg.pushToHDD->GetValue())
+        TransferDownloadsToOPL();
+}
+
+void HDL_Batch_installerFrame::TransferDownloadsToOPL(void)
+{
+    ArtPause _artpause(this); // acces PFSSHELL exclusif (copie vers +OPL) : pause du loader
+#if PFSSHELL_ALLOWED
+    if (HDD_TOKEN.empty())
+    {
+        wxMessageBox(_("No HDD is selected, cannot transfer assets to the HDD."), error_caption, wxICON_ERROR);
+        return;
+    }
+    const char* MNT = "hdd0:+OPL"; // partition de donnees OPL sur le HDD
+    struct AssetSet { const char* sub; const char* filter; };
+    const AssetSet SETS[] = {
+        { "ART", "*.*"   },
+        { "CHT", "*.cht" },
+        { "CFG", "*.cfg" },
+        { "VMC", "*.bin" },
+    };
+    wxBeginBusyCursor();
+    PFSSHELL.CloseDevice(); // au cas ou un device serait deja ouvert
+    if (PFSSHELL.SelectDevice(HDD_TOKEN) != 0)
+    {
+        wxEndBusyCursor();
+        wxMessageBox(_("Could not open the selected HDD (see console log for details)."), error_caption, wxICON_ERROR);
+        return;
+    }
+    // Verifie la presence de la partition +OPL via un montage-test
+    int probe = PFSSHELL.Mount(MNT);
+    PFSSHELL.UMount();
+    if (probe < 0)
+    {
+        PFSSHELL.CloseDevice();
+        wxEndBusyCursor();
+        wxMessageBox(_("The +OPL partition was not found on this HDD.\n\nThe downloaded assets were kept in the local 'Downloads' folder."),
+                     error_caption, wxICON_ERROR);
+        return;
+    }
+    int copied = 0, failed = 0;
+    for (const AssetSet& s : SETS)
+    {
+        wxString localdir = EXEC_PATH + "Downloads\\" + s.sub;
+        if (!wxDirExists(localdir)) continue;
+        PFSSHELL.pfs_mkdir(MNT, "/", s.sub); // cree le sous-dossier (erreur ignoree s'il existe deja)
+        wxArrayString files;
+        wxDir::GetAllFiles(localdir, &files, s.filter, wxDIR_FILES);
+        for (size_t i = 0; i < files.GetCount(); i++)
+        {
+            wxString full = files.Item(i);
+            wxString name = full.substr(full.find_last_of("\\/") + 1);
+            wxString dest = wxString("/") + s.sub + "/" + name;
+            std::cout << "PUSH -> " << MNT << ":pfs:" << dest << "\n";
+            if (PFSSHELL.copyto(MNT, dest.mb_str(), full.mb_str()) == 0)
+            {
+                copied++;
+                wxRemoveFile(full); // on retire la copie locale apres succes (comme le transfert Dokan)
+            }
+            else failed++;
+        }
+    }
+    PFSSHELL.CloseDevice();
+    wxEndBusyCursor();
+    wxMessageBox(wxString::Format(_("Transfer to +OPL finished.\n\nCopied: %d\nFailed: %d"), copied, failed),
+                 wxMessageBoxCaptionStr, (failed > 0) ? wxICON_WARNING : wxICON_INFORMATION);
+    m_artCache.clear(); ClearArtDiskCache();                                  // l'art a change -> invalide cache memoire + disque
+    m_artCacheHdd.clear();                                                    // force la reconstruction au prochain Update_hdd_data
+    if (selected_hdd->GetSelection() != wxNOT_FOUND) List_refresh_request();  // rafraichit la liste (rechargera depuis Downloads/ART)
+#else
+    wxMessageBox(_("Direct HDD transfer is not available in this build."), error_caption, wxICON_WARNING);
+#endif
+}
+
+void HDL_Batch_installerFrame::OnLogTimer(wxTimerEvent& event)
+{
+    if (event.GetId() == ID_ART_TIMER) return; // ce handler est bind sans id : ignorer le timer des vignettes
+    if (!LogPanel) return;
+    if (!wxFileExists("logs/console.log")) return;
+    wxFile f;
+    if (!f.Open("logs/console.log", wxFile::read)) return;
+    wxFileOffset len = f.Length();
+    if (len < m_logOffset) m_logOffset = 0;      // fichier tronque / recree
+    if (len <= m_logOffset) { f.Close(); return; }
+    size_t toRead = (size_t)(len - m_logOffset);
+    wxCharBuffer buf(toRead);
+    f.Seek(m_logOffset);
+    ssize_t got = f.Read(buf.data(), toRead);
+    f.Close();
+    if (got <= 0) return;
+    m_logOffset += got;
+    wxString chunk = wxString::FromUTF8(buf.data(), (size_t)got);
+    if (chunk.empty()) chunk = wxString(buf.data(), wxConvLibc, (size_t)got); // repli si non-UTF8
+    LogPanel->AppendText(chunk);
+}
+
+// --- Helpers medias -------------------------------------------------------
+static wxString RegionFromSerial(const wxString& serial)
+{
+    wxString s = serial.Upper();
+    if (s.StartsWith("SLUS") || s.StartsWith("SCUS") || s.StartsWith("PBPX")) return "USA (NTSC-U/C)";
+    if (s.StartsWith("SLES") || s.StartsWith("SCES") || s.StartsWith("SLED") || s.StartsWith("SCED")) return "Europe (PAL)";
+    if (s.StartsWith("SLPS") || s.StartsWith("SLPM") || s.StartsWith("SCPS") || s.StartsWith("SCAJ") || s.StartsWith("SLAJ")) return "Japan (NTSC-J)";
+    if (s.StartsWith("SLKA") || s.StartsWith("SCKA")) return "Korea";
+    return _("Unknown");
+}
+static wxString ArtLabelFromPath(const wxString& path)
+{
+    wxString f = path.AfterLast('\\').AfterLast('/').Upper();
+    if (f.Contains("_COV2"))   return _("Cover (back)");
+    if (f.Contains("_COV"))    return _("Cover");
+    if (f.Contains("_BG"))     return _("Background");
+    if (f.Contains("_LAB"))    return _("Disc / Label");
+    if (f.Contains("_ICO"))    return _("Icon");
+    if (f.Contains("_LGO"))    return _("Logo");
+    if (f.Contains("_SCR_00")) return _("Screenshot 1");
+    if (f.Contains("_SCR_01")) return _("Screenshot 2");
+    if (f.Contains("_SCR"))    return _("Screenshot");
+    return f;
+}
+
+// --- Chargement des vignettes OPL dans un THREAD de fond ---
+// La liste s'affiche instantanement (icones CD/DVD). Un thread lit les _ICO.png du
+// HDD pendant que l'UI reste 100% fluide ; le thread principal ne fait que decoder
+// la petite icone et la poser sur sa ligne. Barre de progression + bouton "Stop".
+void HDL_Batch_installerFrame::StartArtPrefetch()
+{
+#if PFSSHELL_ALLOWED
+    StopArtPrefetch();
+    if (HDD_TOKEN.empty() || m_installedGames.empty()) return;
+    m_artW = 24; m_artH = 24;
+    wxImageList* il = Installed_game_list->GetImageList(wxIMAGE_LIST_SMALL);
+    if (il) il->GetSize(0, m_artW, m_artH);
+    const wxString cacheDir = EXEC_PATH + "Downloads\\_artcache\\"; // vignettes 24x24 persistantes
+    const wxString artDir   = EXEC_PATH + "Downloads\\ART\\";       // assets telecharges localement
+    if (!wxDirExists(EXEC_PATH + "Downloads")) wxMkdir(EXEC_PATH + "Downloads");
+    if (!wxDirExists(cacheDir)) wxMkdir(cacheDir);
+    if (!wxDirExists(EXEC_PATH + "Downloads\\_artbg")) wxMkdir(EXEC_PATH + "Downloads\\_artbg");
+
+    // 1) Resolution LOCALE d'abord (cache disque + assets telecharges) : AUCUN acces HDD.
+    std::deque<wxString> q;         // a charger (source resolue par le worker)
+    std::vector<wxString> needHdd;  // jeux sans source locale -> peut-etre sur le HDD
+    for (size_t k = 0; k < m_installedGames.size(); k++)
+    {
+        wxString elf = m_installedGames[k].elf; elf.Trim();
+        if (elf.IsEmpty() || m_artCache.count(elf)) continue;
+        if (wxFileExists(cacheDir + elf + ".png") || wxFileExists(artDir + elf + "_ICO.png"))
+            q.push_back(elf);        // dispo en local (cache ou asset telecharge)
+        else
+            needHdd.push_back(elf);  // a verifier sur le HDD
+    }
+    // 2) Ne lister +OPL/ART (acces HDD) QUE s'il reste des jeux sans source locale.
+    //    -> au redemarrage avec un cache complet, zero acces au HDD.
+    m_artNames.Clear();
+    if (!needHdd.empty())
+    {
+        PFSSHELL.CloseDevice();
+        if (PFSSHELL.SelectDevice(HDD_TOKEN) == 0)
+        {
+            std::vector<iox_dirent_t> artdir;
+            if (PFSSHELL.ls("hdd0:+OPL", "/ART", &artdir) == 0)
+                for (size_t d = 0; d < artdir.size(); d++) m_artNames.Add(wxString::FromUTF8(artdir[d].name));
+            PFSSHELL.CloseDevice();
+        }
+        for (size_t k = 0; k < needHdd.size(); k++)
+            if (m_artNames.Index(needHdd[k] + "_ICO.png", false) != wxNOT_FOUND) q.push_back(needHdd[k]);
+    }
+    if (q.empty()) return; // tout est deja en cache / rien a charger
+    { std::lock_guard<std::mutex> lk(m_artQMutex); m_artQueue = q; }
+    m_artTotal = (int)q.size();
+    m_artDoneCount = 0;
+    // Barre de progression (style barre de capacite)
+    if (m_artBar) m_artBar->SetValue(0);
+    if (m_artProgLabel) m_artProgLabel->SetLabel(wxString::Format(_("Loading artwork: %d / %d"), 0, m_artTotal));
+    if (m_artProgPanel) { m_artProgPanel->Show(); Layout(); }
+    ReprioritizeVisible();                       // priorite aux lignes visibles
+    m_artStop = false;
+    m_artLoaderActive = true;
+    int ep = ++m_artEpoch;
+    m_artThread = std::thread(&HDL_Batch_installerFrame::ArtWorkerRun, this, ep);
+    m_artLastTop = -1;
+    if (m_artTimer) m_artTimer->Start(150, wxTIMER_CONTINUOUS); // re-priorisation pendant le scroll (aucune I/O)
+#endif
+}
+
+// Stoppe+joint le thread, libere le device, vide la file et masque la barre.
+// Appele avant toute operation PFS/HDL du thread principal (via ArtPause) : apres
+// join, le worker ne touche plus PFSSHELL et le device est referme.
+void HDL_Batch_installerFrame::StopArtPrefetch()
+{
+#if PFSSHELL_ALLOWED
+    ++m_artEpoch;                                 // invalide les callbacks encore en vol
+    m_artStop = true;
+    if (m_artThread.joinable()) m_artThread.join();
+    m_artStop = false;
+    m_artLoaderActive = false;
+    if (m_artTimer && m_artTimer->IsRunning()) m_artTimer->Stop();
+    { std::lock_guard<std::mutex> lk(m_artQMutex); m_artQueue.clear(); }
+    if (m_artProgPanel && m_artProgPanel->IsShown()) { m_artProgPanel->Hide(); Layout(); }
+#endif
+}
+
+// Corps du thread de fond : lit les _ICO.png du HDD vers des fichiers temporaires et
+// notifie le thread principal. N'appelle AUCUNE fonction GUI (uniquement PFS + I/O).
+void HDL_Batch_installerFrame::ArtWorkerRun(int epoch)
+{
+#if PFSSHELL_ALLOWED
+    const wxString cacheDir = EXEC_PATH + "Downloads\\_artcache\\";
+    const wxString artDir   = EXEC_PATH + "Downloads\\ART\\";
+    const wxString bg       = EXEC_PATH + "Downloads\\_artbg\\";
+    bool devOpen = false; // le device n'est ouvert QUE si une lecture HDD est reellement necessaire
+    for (;;)
+    {
+        if (m_artStop) break;
+        wxString elf;
+        { std::lock_guard<std::mutex> lk(m_artQMutex);
+          if (m_artQueue.empty()) break;
+          elf = m_artQueue.front(); m_artQueue.pop_front(); }
+        wxString path; int source = ART_FROM_HDD;
+        wxString cf = cacheDir + elf + ".png";       // cache disque (deja 24x24)
+        wxString la = artDir + elf + "_ICO.png";      // asset telecharge localement
+        if (wxFileExists(cf))      { path = cf; source = ART_FROM_CACHE; }
+        else if (wxFileExists(la)) { path = la; source = ART_FROM_LOCAL; }
+        else                                          // lecture depuis le HDD
+        {
+            if (!devOpen)
+            {
+                if (PFSSHELL.SelectDevice(HDD_TOKEN) != 0)
+                { wxString e = elf; CallAfter([this, epoch, e]{ OnArtResult(epoch, e, wxString(), ART_FROM_HDD); }); continue; }
+                devOpen = true;
+            }
+            wxString dst = bg + elf + "_ICO.png";
+            wxString src = "/ART/" + elf + "_ICO.png";
+            if (PFSSHELL.recoverfile("hdd0:+OPL", src.mb_str(), dst.mb_str()) == 0) { path = dst; source = ART_FROM_HDD; }
+        }
+        wxString e = elf, p = path; int s = source;
+        CallAfter([this, epoch, e, p, s]{ OnArtResult(epoch, e, p, s); }); // decode + pose sur le thread UI
+    }
+    if (devOpen) PFSSHELL.CloseDevice();
+    CallAfter([this, epoch]{ ArtLoaderFinished(epoch); });
+#endif
+}
+
+// Thread UI : decode la petite icone (sans popup libpng), la pose sur la ligne, avance la
+// barre, et ecrit la vignette 24x24 dans le cache disque (sauf si elle en vient deja).
+void HDL_Batch_installerFrame::OnArtResult(int epoch, const wxString& elf, const wxString& path, int source)
+{
+    if (epoch != m_artEpoch) { if (source == ART_FROM_HDD && !path.IsEmpty()) wxRemoveFile(path); return; } // perime
+    if (!path.IsEmpty())
+    {
+        wxImage img;
+        { wxLogNull noLog; img.LoadFile(path, wxBITMAP_TYPE_ANY); } // avale les avertissements libpng (iCCP)
+        if (img.IsOk())
+        {
+            if (img.GetWidth() != m_artW || img.GetHeight() != m_artH)
+                img.Rescale(m_artW, m_artH, wxIMAGE_QUALITY_HIGH); // le cache est deja a la bonne taille
+            wxBitmap bmp(img);
+            m_artCache[elf] = bmp;
+            UpdateRowIcon(elf, bmp);
+            if (source != ART_FROM_CACHE) // persiste la vignette pour les prochains lancements
+            {
+                wxString cf = EXEC_PATH + "Downloads\\_artcache\\" + elf + ".png";
+                wxLogNull noLog; img.SaveFile(cf, wxBITMAP_TYPE_PNG);
+            }
+        }
+        if (source == ART_FROM_HDD) wxRemoveFile(path); // fichier temporaire
+    }
+    int done = ++m_artDoneCount;
+    if (m_artBar) m_artBar->SetValue(m_artTotal > 0 ? (int)(100LL * done / m_artTotal) : 100);
+    if (m_artProgLabel) m_artProgLabel->SetLabel(wxString::Format(_("Loading artwork: %d / %d"), done, m_artTotal));
+}
+
+// Vide le cache disque des vignettes (appele quand l'art du HDD a change).
+void HDL_Batch_installerFrame::ClearArtDiskCache()
+{
+    wxString dir = EXEC_PATH + "Downloads\\_artcache";
+    if (!wxDirExists(dir)) return;
+    wxArrayString files;
+    wxDir::GetAllFiles(dir, &files, "*.png", wxDIR_FILES);
+    for (size_t i = 0; i < files.GetCount(); i++) wxRemoveFile(files[i]);
+}
+
+// Thread UI : fin du chargement -> joint le thread et masque la barre.
+void HDL_Batch_installerFrame::ArtLoaderFinished(int epoch)
+{
+    if (epoch != m_artEpoch) return;              // fin d'un chargement deja remplace/annule
+    if (m_artThread.joinable()) m_artThread.join();
+    m_artLoaderActive = false;
+    if (m_artTimer && m_artTimer->IsRunning()) m_artTimer->Stop();
+    if (m_artProgPanel && m_artProgPanel->IsShown()) { m_artProgPanel->Hide(); Layout(); }
+}
+
+// Bouton "Stop" : interrompt le chargement des vignettes.
+void HDL_Batch_installerFrame::OnArtCancel(wxCommandEvent& event)
+{
+    StopArtPrefetch();
+}
+
+// Remonte les lignes actuellement visibles en tete de file (priorite au regard).
+void HDL_Batch_installerFrame::ReprioritizeVisible()
+{
+    long top = Installed_game_list->GetTopItem();
+    long per = Installed_game_list->GetCountPerPage();
+    long cnt = Installed_game_list->GetItemCount();
+    std::vector<wxString> vis;
+    for (long i = top; i <= top + per + 1 && i < cnt; i++)
+    {
+        wxString e = Installed_game_list->GetItemText(i, 1); e.Trim();
+        if (!e.IsEmpty()) vis.push_back(e);
+    }
+    if (vis.empty()) return;
+    std::lock_guard<std::mutex> lk(m_artQMutex);
+    for (int k = (int)vis.size() - 1; k >= 0; k--) // insere en tete, ordre d'affichage preserve
+    {
+        std::deque<wxString>::iterator it = std::find(m_artQueue.begin(), m_artQueue.end(), vis[k]);
+        if (it != m_artQueue.end() && it != m_artQueue.begin())
+        {
+            m_artQueue.erase(it);
+            m_artQueue.push_front(vis[k]);
+        }
+    }
+}
+
+// Timer (pendant le chargement) : si la vue a defile, re-prioriser les lignes visibles.
+void HDL_Batch_installerFrame::OnArtTimer(wxTimerEvent& event)
+{
+    if (!m_artLoaderActive) return;
+    long top = Installed_game_list->GetTopItem();
+    if (top == m_artLastTop) return;
+    m_artLastTop = top;
+    ReprioritizeVisible();
+}
+
+// Pose la vignette sur la ligne du jeu correspondant (si elle est visible avec le
+// filtre courant). Ne touche ni au scroll ni a la selection.
+void HDL_Batch_installerFrame::UpdateRowIcon(const wxString& elf, const wxBitmap& bmp)
+{
+    if (!bmp.IsOk()) return;
+    wxImageList* il = Installed_game_list->GetImageList(wxIMAGE_LIST_SMALL);
+    if (!il) return;
+    int count = Installed_game_list->GetItemCount();
+    for (int i = 0; i < count; i++)
+    {
+        wxString e = Installed_game_list->GetItemText(i, 1); e.Trim();
+        if (e == elf) { Installed_game_list->SetItemImage(i, il->Add(bmp)); break; }
+    }
+}
+
+// Double-clic sur un jeu installe : extrait tous les arts trouves sur le HDD
+// (+OPL/ART) et les affiche dans une galerie. Si rien : message "aucun media".
+void HDL_Batch_installerFrame::OnInstalledGameActivated(wxListEvent& event)
+{
+    ArtPause _artpause(this); // acces PFSSHELL exclusif (extraction galerie) : pause du loader (reprise a la fermeture)
+#if PFSSHELL_ALLOWED
+    long item = event.GetIndex();
+    if (item < 0) return;
+    wxString elf    = Installed_game_list->GetItemText(item, 1); elf.Trim();
+    wxString gname  = Installed_game_list->GetItemText(item, 0);
+    wxString gsize  = Installed_game_list->GetItemText(item, 2);
+    wxString gmedia = Installed_game_list->GetItemText(item, 3);
+    if (HDD_TOKEN.empty()) { wxMessageBox(_("No HDD selected."), error_caption, wxICON_ERROR); return; }
+
+    static const char* SUFFIXES[] = {
+        "_COV.jpg", "_COV2.jpg", "_BG.jpg", "_LAB.jpg",
+        "_ICO.png", "_LGO.png", "_SCR_00.jpg", "_SCR_01.jpg"
+    };
+    wxString cachedir = EXEC_PATH + "Downloads\\_mediacache";
+    if (!wxDirExists(EXEC_PATH + "Downloads")) wxMkdir(EXEC_PATH + "Downloads");
+    if (!wxDirExists(cachedir)) wxMkdir(cachedir);
+
+    wxArrayString found;
+    wxBeginBusyCursor();
+    PFSSHELL.CloseDevice();
+    if (PFSSHELL.SelectDevice(HDD_TOKEN) == 0)
+    {
+        const char* MNT = "hdd0:+OPL";
+        for (size_t s = 0; s < sizeof(SUFFIXES) / sizeof(SUFFIXES[0]); s++)
+        {
+            wxString dst = cachedir + "\\" + elf + SUFFIXES[s];
+            if (wxFileExists(dst)) wxRemoveFile(dst);
+            wxString src = "/ART/" + elf + SUFFIXES[s];
+            if (PFSSHELL.recoverfile(MNT, src.mb_str(), dst.mb_str()) == 0
+                && wxFileExists(dst) && wxFileName::GetSize(dst) > 0)
+                found.Add(dst);
+            else if (wxFileExists(dst))
+                wxRemoveFile(dst);
+        }
+        PFSSHELL.CloseDevice();
+    }
+    wxEndBusyCursor();
+
+    wxString info = wxString::Format(_("Name:    %s\nSerial:  %s\nRegion:  %s\nSize:    %s MB\nMedia:   %s"),
+                                     gname, elf, RegionFromSerial(elf), gsize, gmedia);
+    if (found.IsEmpty())
+        info += "\n\n" + wxString(_("No media found on the HDD for this game."));
+    ShowMediaGallery(gname, info, found);
+#endif
+}
+
+// Fenetre galerie : en-tete d'infos du jeu + images (chacune avec son libelle),
+// dans une zone defilante.
+void HDL_Batch_installerFrame::ShowMediaGallery(const wxString& title, const wxString& infoText, const wxArrayString& images)
+{
+    wxDialog dlg(this, wxID_ANY, title, wxDefaultPosition, wxSize(760, 600),
+                 wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
+    wxBoxSizer* root = new wxBoxSizer(wxVERTICAL);
+    root->Add(new wxStaticText(&dlg, wxID_ANY, infoText), 0, wxALL, 8);
+    root->Add(new wxStaticLine(&dlg, wxID_ANY), 0, wxEXPAND | wxLEFT | wxRIGHT, 4);
+    wxScrolledWindow* scroll = new wxScrolledWindow(&dlg, wxID_ANY);
+    scroll->SetScrollRate(10, 10);
+    wxWrapSizer* ws = new wxWrapSizer(wxHORIZONTAL);
+    for (size_t i = 0; i < images.GetCount(); i++)
+    {
+        wxImage img;
+        bool okimg;
+        { wxLogNull noLog; okimg = img.LoadFile(images[i], wxBITMAP_TYPE_ANY); } // pas de popup libpng (iCCP)
+        if (!okimg || !img.IsOk()) continue;
+        int w = img.GetWidth(), h = img.GetHeight();
+        if (w > 0 && h > 0)
+        {
+            double sc = 240.0 / w;
+            if (h * sc > 320.0) sc = 320.0 / h;
+            if (sc < 1.0) img.Rescale((int)(w * sc), (int)(h * sc), wxIMAGE_QUALITY_HIGH);
+        }
+        wxBoxSizer* cell = new wxBoxSizer(wxVERTICAL);
+        cell->Add(new wxStaticBitmap(scroll, wxID_ANY, wxBitmap(img)), 0, wxALIGN_CENTER_HORIZONTAL);
+        cell->Add(new wxStaticText(scroll, wxID_ANY, ArtLabelFromPath(images[i])), 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, 3);
+        ws->Add(cell, 0, wxALL, 8);
+    }
+    scroll->SetSizer(ws);
+    root->Add(scroll, 1, wxEXPAND | wxALL, 4);
+    dlg.SetSizer(root);
+    dlg.ShowModal();
+}
+
+void HDL_Batch_installerFrame::OnCopyAssetsToHDD(wxCommandEvent& event)
+{
+    // Meme action que la case "Copy to HDD" du gestionnaire de telechargements :
+    // pousse les assets locaux (Downloads/) vers la partition +OPL du HDD.
+    TransferDownloadsToOPL();
+}
+
+void HDL_Batch_installerFrame::OnRefreshListHotkey(wxCommandEvent& event)
+{
+    if (selected_hdd->GetSelection() == wxNOT_FOUND) return;
+    if (selected_hdd->GetStringSelection().IsEmpty()) return;
+    List_refresh_request();
+}
+
+void HDL_Batch_installerFrame::CleanIsoStage()
+{
+    wxString stage = EXEC_PATH + "_iso_stage";
+    if (wxDirExists(stage))
+    {
+        COLOR(08) std::cout << "> cleaning extracted-ISO staging folder\n"; COLOR(07)
+        wxFileName::Rmdir(stage, wxPATH_RMDIR_RECURSIVE);
+    }
+}
+
+// Extrait une archive vers un sous-dossier de staging via Common\7z.exe et renvoie
+// la liste des images de jeu trouvees dedans.
+wxArrayString HDL_Batch_installerFrame::ExtractArchiveGames(const wxString& archive)
+{
+    wxArrayString result;
+    wxString stage = EXEC_PATH + "_iso_stage";
+    if (!wxDirExists(stage)) wxMkdir(stage);
+    wxFileName af(archive);
+    wxString sub = stage + "\\" + af.GetName();
+    if (!wxDirExists(sub)) wxMkdir(sub);
+
+    wxString cmd = wxString::Format("Common\\7z.exe x -o\"%s\" -y \"%s\"", sub, archive);
+    std::cout << "> extracting archive: " << archive.ToStdString() << "\n";
+    wxArrayString out, err;
+    wxExecute(cmd, out, err, wxEXEC_SYNC | wxEXEC_HIDE_CONSOLE); // sans fenetre, sortie -> console embarquee
+    for (size_t i = 0; i < out.GetCount(); i++) std::cout << out.Item(i).ToStdString() << "\n";
+    for (size_t i = 0; i < err.GetCount(); i++) std::cout << err.Item(i).ToStdString() << "\n";
+
+    wxArrayString files;
+    wxDir::GetAllFiles(sub, &files); // recursif
+    for (size_t i = 0; i < files.GetCount(); i++)
+    {
+        wxString ext = files.Item(i).AfterLast('.').Lower();
+        if (ext == "iso" || ext == "cue" || ext == "nrg" || ext == "gi" || ext == "iml" || ext == "zso")
+            result.Add(files.Item(i));
+    }
+    return result;
+}
+
+void HDL_Batch_installerFrame::OnDropFilesEvent(wxDropFilesEvent& event)
+{
+    wxArrayString files;
+    int n = event.GetNumberOfFiles();
+    wxString* f = event.GetFiles();
+    for (int i = 0; i < n && f; i++) files.Add(f[i]);
+    if (!files.IsEmpty()) AddGamesToList(files);
+}
+
+// Ajoute des fichiers a la liste d'installation. Les images de jeu (ISO/CUE/...)
+// sont validees (is_PS2) et ajoutees. Les archives (zip/rar/7z) sont ajoutees
+// TELLES QUELLES : elles seront extraites au moment de l'installation, puis l'ISO
+// extrait supprime apres une install reussie (voir OninstallClick).
+// Telecharge les assets (art + cfg + cht) d'un jeu dans Downloads/ pour son serial.
+// Appele APRES une installation reussie quand l'option auto-assets est active.
+void HDL_Batch_installerFrame::DownloadAssetsForELF(const wxString& elfIn)
+{
+    wxString elf = elfIn; elf.Trim();
+    if (elf.IsEmpty()) return;
+    if (!wxDirExists("Downloads"))        wxMkdir("Downloads");
+    if (!wxDirExists("Downloads\\ART"))   wxMkdir("Downloads\\ART");
+    if (!wxDirExists("Downloads\\CFG"))   wxMkdir("Downloads\\CFG");
+    if (!wxDirExists("Downloads\\CHT"))   wxMkdir("Downloads\\CHT");
+    struct A { const char* suf; const char* urlsuf; };
+    static const A arts[] = {
+        {"_COV.jpg","_COV.jpg"}, {"_COV2.jpg","_COV2.jpg"}, {"_BG.jpg","_BG_00.jpg"},
+        {"_ICO.png","_ICO.png"}, {"_LGO.png","_LGO.png"},   {"_LAB.jpg","_LAB.jpg"},
+        {"_SCR_00.jpg","_SCR_00.jpg"}, {"_SCR_01.jpg","_SCR_01.jpg"}
+    };
+    wxArrayString o, e;
+    for (size_t k = 0; k < sizeof(arts) / sizeof(arts[0]); k++)
+    {
+        wxString cmd = wxString::Format("common\\wget.exe -q %s%s%%2F%s%s -O \"Downloads\\ART\\%s%s\"",
+                                        CFG_ARTURL, elf, elf, arts[k].urlsuf, elf, arts[k].suf);
+        o.Clear(); e.Clear(); wxExecute(cmd, o, e, wxEXEC_SYNC | wxEXEC_HIDE_CONSOLE);
+    }
+    wxExecute("common\\wget.exe -q https://raw.githubusercontent.com/israpps/PS2-OPL-CFG-Database/master/CFG_en/" + elf + ".cfg -O \"Downloads\\CFG\\" + elf + ".cfg\"", o, e, wxEXEC_SYNC | wxEXEC_HIDE_CONSOLE);
+    wxExecute("common\\wget.exe -q https://raw.githubusercontent.com/PS2-Widescreen/OPL-Widescreen-Cheats/main/CHT/" + elf + ".cht -O \"Downloads\\CHT\\" + elf + ".cht\"", o, e, wxEXEC_SYNC | wxEXEC_HIDE_CONSOLE);
+}
+
+void HDL_Batch_installerFrame::AddGamesToList(const wxArrayString& paths)
+{
+    // Met le chargement des vignettes en pause pendant l'ajout : le probing des ISO
+    // lance HDL.EXE et l'insertion touche la liste -> on evite tout conflit avec le
+    // thread, puis le chargement reprend automatiquement. L'ajout reste donc dispo
+    // meme pendant que les icones se chargent.
+    ArtPause _artpause(this);
+    wxBeginBusyCursor();
+    int added = 0, discarded = 0;
+    for (size_t i = 0; i < paths.GetCount(); i++)
+    {
+        wxString p = paths.Item(i);
+        wxString ext = p.AfterLast('.').Lower();
+        if (ext == "zip" || ext == "rar" || ext == "7z")
+        { m_pending.Add(p); InsertPendingRow(p); added++; }
+        else if (ext == "iso" || ext == "cue" || ext == "nrg" || ext == "gi" || ext == "iml" || ext == "zso")
+        {
+            int type = -1;
+            if (is_PS2(p, &type)) { m_pending.Add(p); InsertPendingRow(p); added++; }
+            else discarded++;
+        }
+    }
+    wxEndBusyCursor();
+    UpdateInstallButton();
+    std::cout << "> add: " << added << " item(s) queued, " << discarded << " discarded\n";
+    if (added == 0)
+        wxMessageBox(_("No valid PS2 game or archive was found in the dropped file(s)."), _("Information:"), wxICON_INFORMATION);
+}
+
+// Ajoute une ligne "en attente" (fond jaune pale) en haut de la liste unifiee.
+void HDL_Batch_installerFrame::InsertPendingRow(const wxString& path)
+{
+    wxString name = path.AfterLast('\\').AfterLast('/');
+    long i = Installed_game_list->InsertItem(0, name);
+    Installed_game_list->SetItemBackgroundColour(i, wxColour(255, 249, 196));
+    Installed_game_list->SetItem(i, 3, _("pending"));
+}
+
+// Affiche/masque le bouton Install selon qu'il y a des jeux en attente.
+void HDL_Batch_installerFrame::UpdateInstallButton()
+{
+    bool has = !m_pending.IsEmpty();
+    install->Show(has);
+    install->Enable(has && selected_hdd->GetSelection() != wxNOT_FOUND);
+    wxWindow* p = install->GetParent();
+    if (p) p->Layout();
 }
 
 void HDL_Batch_installerFrame::OnInstalled_game_listItemRClick1(wxListEvent& event)
@@ -1736,6 +2819,7 @@ void HDL_Batch_installerFrame::OnGameInfoRequest(wxCommandEvent& event)
 
 void HDL_Batch_installerFrame::OnMBRExtractRequestClick(wxCommandEvent& event)
 {
+    ArtPause _artpause(this); // HDL.EXE dump_mbr (acces disque) : pause du loader
     long KELF_size, retcode;
     if (!wxDirExists("Extracted_MBR"))
         wxMkdir("Extracted_MBR");
@@ -1973,6 +3057,7 @@ void HDL_Batch_installerFrame::OnButton4Click1(wxCommandEvent& event)
 
 void HDL_Batch_installerFrame::OnManualInjectionRequest(wxCommandEvent& event)
 {
+    ArtPause _artpause(this); // ecriture HDL.EXE (modify_header) : pause du loader
     wxString HDD = selected_hdd->GetString( selected_hdd->GetSelection() );
     wxString system_cnf  = EXEC_PATH + "system.cnf";
     wxString icon_sys    = EXEC_PATH + "icon.sys";
@@ -2034,6 +3119,7 @@ void HDL_Batch_installerFrame::OnManualInjectionRequest(wxCommandEvent& event)
 
 void HDL_Batch_installerFrame::OnLoadCustomIcon2InstalledGameRequest(wxCommandEvent& event)
 {
+    ArtPause _artpause(this); // ecriture HDL.EXE / acces PFSSHELL : pause du loader
     wxString HDD = selected_hdd->GetString( selected_hdd->GetSelection() );
     wxString system_cnf  = EXEC_PATH + "system.cnf";
     wxString icon_sys    = EXEC_PATH + "icon.sys";

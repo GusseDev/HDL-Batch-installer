@@ -36,3 +36,6 @@ HDL-Batch-installer-SRC/_bin/playground/wx*.dll
 HDL-Batch-installer-SRC/HDL-Batch-installer.layout
 /HDL-Batch-installer-SRC/_bin/playground/Common/HDD-OSD-Icon-Database-main
 HDL-Batch-installer-SRC/_bin/playground/Common/ICONDB.ZIP
+
+# Config locale du script de build (chemins machine)
+/build.config

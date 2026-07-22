@@ -209,6 +209,12 @@ Config::Config(wxWindow* parent,wxWindowID id,const wxPoint& pos,const wxSize& s
     HDDManagerSubPartDSP->SetValue(CFGT.HDDManagerDisplaySubpart);
 
     main_config->Read("FEATURES/allow_experimental",    &CFGT.allow_experimental, false);
+    // Option: telecharger automatiquement les assets a l'ajout d'un jeu
+    AUTO_ASSETS_CHK = new wxCheckBox(Panel1, wxID_ANY, _("Auto-download assets when adding a game"));
+    GridSizer1->Add(AUTO_ASSETS_CHK, 1, wxALL|wxEXPAND, 5);
+    { bool v; main_config->Read("Installation/auto_download_assets", &v, false); AUTO_ASSETS_CHK->SetValue(v); }
+    Panel1->Layout();
+    Fit();
     delete main_config;
 }
 
@@ -271,6 +277,7 @@ void Config::SaveSettings()
     WRITE_CONFIG_AND_REPORT("FEATURES/allow_experimental",CFGT.allow_experimental);
     WRITE_CONFIG_AND_REPORT("HDDManager/display_games_titles",CFGT.HDDManagerGameTitleDISP);
     WRITE_CONFIG_AND_REPORT("HDDManager/display_subpartition",CFGT.HDDManagerDisplaySubpart);
+    WRITE_CONFIG_AND_REPORT("Installation/auto_download_assets", AUTO_ASSETS_CHK->GetValue());
 
     std::cout << "> flushing settings handler and forcing file writing\n";
     main_config->Flush();//force data writing

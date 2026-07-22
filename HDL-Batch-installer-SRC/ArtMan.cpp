@@ -7,6 +7,7 @@
  * License:   GPL-3.0
  **************************************************************/
 #include "ArtMan.h"
+#include <wx/progdlg.h>
 
 //(*InternalHeaders(ArtMan)
 #include <wx/intl.h>
@@ -122,6 +123,13 @@ ArtMan::ArtMan(wxWindow* parent,
     Connect(wxID_ANY,wxEVT_INIT_DIALOG,(wxObjectEventFunction)&ArtMan::OnInit);
     Connect(wxEVT_PAINT,(wxObjectEventFunction)&ArtMan::OnPaint);
     //*)
+    // --- Option: envoyer les assets directement sur le HDD (+OPL) apres telechargement ---
+    pushToHDD = new wxCheckBox(this, wxID_ANY, _("Copy to HDD (+OPL) after download"));
+    pushToHDD->SetValue(false);
+    pushToHDD->SetToolTip(_("Transfer the downloaded assets directly into the +OPL partition of the selected HDD (no Dokan mount)"));
+    FlexGridSizer1->Add(pushToHDD, 1, wxALL|wxEXPAND, 5);
+    FlexGridSizer1->Fit(this);
+    FlexGridSizer1->SetSizeHints(this);
 }
 
 ArtMan::~ArtMan()
@@ -170,11 +178,24 @@ long ArtMan::Request_art(wxString ELF, wxString suffix)
     command.append(suffix);
     command.append("\"");
     COLOR(0d)
-    wget_return_value = wxExecute(command,(FAST->IsChecked()) ? wxEXEC_ASYNC : wxEXEC_SYNC);
+    wget_return_value = run_hidden(command);
     COLOR(07)
     //if (wget_return_value != 0) {wxRemoveFile( wxString::Format("\"%sDownloads\\ART\\%s%s\"", EXEC_PATH, ELF, suffix) );}
     //cout << "[" << std::string(command.mb_str()) << "]\n";
     return wget_return_value;
+}
+
+long ArtMan::run_hidden(const wxString& command)
+{
+    // Execute la commande SANS fenetre console (plus de popup a chaque telechargement).
+    // En mode synchrone, la sortie de wget est renvoyee dans la console embarquee de l'app.
+    if (FAST->IsChecked())
+        return wxExecute(command, wxEXEC_ASYNC | wxEXEC_HIDE_CONSOLE);
+    wxArrayString out, err;
+    long rc = wxExecute(command, out, err, wxEXEC_SYNC | wxEXEC_HIDE_CONSOLE);
+    for (size_t i = 0; i < out.GetCount(); i++) std::cout << out.Item(i).ToStdString() << "\n";
+    for (size_t i = 0; i < err.GetCount(); i++) std::cout << err.Item(i).ToStdString() << "\n";
+    return rc;
 }
 
 
@@ -195,10 +216,13 @@ void ArtMan::OndownloadClick(wxCommandEvent& event)
     string ELF;
     COLOR(0e) std::cout <<"Downloading...\n";
     COLOR(07)
-    wxBeginBusyCursor();
+    bool interrupted = false;
+    wxProgressDialog download_progress(_("Downloading"), wxEmptyString, (int)ELF_t.GetCount(), this,
+                                       wxPD_APP_MODAL|wxPD_CAN_ABORT|wxPD_ELAPSED_TIME|wxPD_AUTO_HIDE);
     wxString gauge_switch = (FAST->IsChecked()) ? "" : "--show-progress";
     for (size_t x=0; x<ELF_t.GetCount(); x++)
     {
+        if (!download_progress.Update((int)x, ELF_t.Item(x))) { interrupted = true; break; } // interruption demandee
         ELF = std::string(ELF_t.Item(x).mb_str());
         TextCtrl1->Clear();
         TextCtrl1->AppendText(ELF_t.Item(x));
@@ -244,7 +268,7 @@ void ArtMan::OndownloadClick(wxCommandEvent& event)
                 wxMkdir("Downloads\\CFG");
             }
             commnand = "common\\wget.exe -q " + gauge_switch + " https://raw.githubusercontent.com/israpps/PS2-OPL-CFG-Database/master/CFG_en/" + ELF + ".cfg -O \"Downloads\\CFG\\" + ELF + ".cfg\"";
-            /*retcode = */wxExecute(commnand, (FAST->IsChecked()) ? wxEXEC_ASYNC : wxEXEC_SYNC );
+            /*retcode = */run_hidden(commnand);
             //if (retcode != 0) {wxRemoveFile( wxString::Format("\"%sDownloads\\CFG\\%s.cfg\"", EXEC_PATH, ELF) );}
             COLOR(07)
         }
@@ -256,7 +280,7 @@ void ArtMan::OndownloadClick(wxCommandEvent& event)
                 wxMkdir("Downloads\\CHT");
             }
             commnand = "common\\wget.exe -q " + gauge_switch + " https://raw.githubusercontent.com/PS2-Widescreen/OPL-Widescreen-Cheats/main/CHT/" + ELF + ".cht -O \"Downloads\\CHT\\" + ELF + ".cht\"";
-            /*retcode = */wxExecute(commnand, (FAST->IsChecked()) ? wxEXEC_ASYNC : wxEXEC_SYNC );
+            /*retcode = */run_hidden(commnand);
             //if (retcode != 0) {wxRemoveFile( wxString::Format("\"%sDownloads\\CHT\\%s.cht\"", EXEC_PATH, ELF) );}
             COLOR(07)
         }
@@ -264,10 +288,9 @@ void ArtMan::OndownloadClick(wxCommandEvent& event)
             wxMilliSleep(5000);
     }
     cleanup();
-    wxEndBusyCursor();
-    COLOR(0a) cout << "Download finished!\n";
+    COLOR(0a) cout << (interrupted ? "Download interrupted!\n" : "Download finished!\n");
     COLOR(07)
-    wxMessageBox(_("Downloads finished!"),"",wxICON_INFORMATION);
+    wxMessageBox(interrupted ? _("Download interrupted.") : _("Downloads finished!"),"",wxICON_INFORMATION);
 }
 
 void ArtMan::OnmarkallClick(wxCommandEvent& event)
@@ -302,5 +325,5 @@ void ArtMan::cleanup(void)
         a.Write(script_contents);
         COLOR(07)
     }
-    wxExecute(wxString::Format("cmd.exe /c \"%sDownloads\\Clear_broken_images.bat\"",EXEC_PATH),wxEXEC_SYNC);
+    wxExecute(wxString::Format("cmd.exe /c \"%sDownloads\\Clear_broken_images.bat\"",EXEC_PATH),wxEXEC_SYNC|wxEXEC_HIDE_CONSOLE);
 }
